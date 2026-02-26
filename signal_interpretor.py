@@ -1,24 +1,30 @@
 import io
 import pickle
-import math
-from typing import Optional, Tuple, List
+import platform
+import sys
+import traceback
+from typing import Optional, Tuple
 
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
 
-import mediapipe as mp
-
-
+# -----------------------------
+# Page config
+# -----------------------------
 st.set_page_config(page_title="AI Sign Interpreter (Camera)", page_icon="🤟", layout="wide")
 st.title("🤟 AI Sign Language Interpreter (Camera)")
-st.caption("Cloud-friendly version (no OpenCV). Uses camera snapshots + MediaPipe Hands.")
-
+st.caption("Cloud-friendly version (no OpenCV in your code). Uses camera snapshots + MediaPipe Hands.")
 
 # -----------------------------
-# Sidebar
+# Sidebar: Debugger + Settings
 # -----------------------------
 with st.sidebar:
+    st.header("🪲 Debugger")
+    debug_mode = st.toggle("Enable debug panel", value=True)
+    stop_after_debug = st.toggle("Stop app after debug (avoid crash)", value=False)
+
+    st.divider()
     st.header("⚙️ Settings")
     show_landmarks = st.toggle("Draw hand landmarks", value=True)
 
@@ -31,22 +37,83 @@ with st.sidebar:
     model_file = st.file_uploader("Upload model", type=["pkl"])
     conf_thresh = st.slider("Min confidence (if predict_proba exists)", 0.0, 1.0, 0.6, 0.05)
 
+# -----------------------------
+# Debug utilities
+# -----------------------------
+def debug_box(title: str, obj):
+    with st.expander(title, expanded=True):
+        st.write(obj)
 
-def load_model(file) -> Optional[object]:
-    if file is None:
-        return None
+def show_environment_debug():
+    info = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "executable": sys.executable,
+        "sys_path_head": sys.path[:6],
+    }
+    debug_box("Environment", info)
+
+def show_import_debug(module_name: str):
     try:
-        return pickle.loads(file.read())
+        mod = __import__(module_name)
+        data = {
+            "module": module_name,
+            "__file__": getattr(mod, "__file__", None),
+            "__version__": getattr(mod, "__version__", None),
+            "dir_has_solutions": ("solutions" in dir(mod)),
+            "hasattr_solutions": hasattr(mod, "solutions"),
+        }
+        debug_box(f"Import debug: {module_name}", data)
+        return mod, None
     except Exception as e:
-        st.sidebar.error(f"Model load error: {e}")
-        return None
-
-
-MODEL = load_model(model_file)
-
+        err = {
+            "module": module_name,
+            "error": repr(e),
+            "traceback": traceback.format_exc(),
+        }
+        debug_box(f"Import FAILED: {module_name}", err)
+        return None, e
 
 # -----------------------------
-# MediaPipe Hands
+# Debug panel (runs before mediapipe usage)
+# -----------------------------
+if debug_mode:
+    show_environment_debug()
+
+# Try import mediapipe safely (so you see what's happening)
+mp, mp_err = show_import_debug("mediapipe") if debug_mode else (None, None)
+
+if mp is None:
+    st.error("MediaPipe could not be imported. Check Streamlit logs and dependencies.")
+    st.stop()
+
+# If mediapipe imported but solutions is missing, stop with a helpful message
+has_solutions = hasattr(mp, "solutions")
+if debug_mode:
+    debug_box("MediaPipe API check", {
+        "has_mp_solutions": has_solutions,
+        "expected_for_this_app": "mp.solutions.hands should exist (legacy Solutions API)",
+        "your_next_step_if_false": (
+            "Streamlit Cloud is not using mediapipe==0.10.30 OR something is shadowing mediapipe. "
+            "Make sure requirements.txt is in the app folder/root, clear cache/rebuild, "
+            "and ensure there is no mediapipe.py or mediapipe/ folder in your repo."
+        )
+    })
+
+if stop_after_debug:
+    st.info("Stopped after debug (as requested). Turn off 'Stop app after debug' to continue.")
+    st.stop()
+
+if not has_solutions:
+    st.error(
+        "Your installed mediapipe does NOT have mp.solutions, so this script cannot run.\n\n"
+        "Fix: Ensure Streamlit Cloud actually installs mediapipe==0.10.30 (requirements.txt location + rebuild), "
+        "and ensure you do not have a mediapipe.py or mediapipe/ in your repo."
+    )
+    st.stop()
+
+# -----------------------------
+# Now safe to use mp.solutions
 # -----------------------------
 mp_hands = mp.solutions.hands
 
@@ -56,6 +123,19 @@ hands = mp_hands.Hands(
     min_detection_confidence=0.6,
 )
 
+# -----------------------------
+# Model loading
+# -----------------------------
+def load_model(file) -> Optional[object]:
+    if file is None:
+        return None
+    try:
+        return pickle.loads(file.read())
+    except Exception as e:
+        st.sidebar.error(f"Model load error: {e}")
+        return None
+
+MODEL = load_model(model_file)
 
 # -----------------------------
 # Helpers
@@ -75,7 +155,6 @@ def landmarks_to_features(hand_landmarks) -> np.ndarray:
 
     return pts.flatten()
 
-
 def predict_with_model(model, feats: np.ndarray, threshold: float) -> Tuple[str, float]:
     try:
         if hasattr(model, "predict_proba"):
@@ -91,13 +170,13 @@ def predict_with_model(model, feats: np.ndarray, threshold: float) -> Tuple[str,
     except Exception:
         return "UNKNOWN", 0.0
 
-
 def demo_gesture(hand_landmarks) -> Tuple[str, float]:
     """
     Simple demo gesture rules:
     - OPEN_PALM
     - FIST
     - THUMBS_UP
+    NOTE: This is a demo; real sign recognition needs training.
     """
     tips = [4, 8, 12, 16, 20]
     pips = [3, 6, 10, 14, 18]
@@ -117,15 +196,11 @@ def demo_gesture(hand_landmarks) -> Tuple[str, float]:
 
     return "UNKNOWN", 0.40
 
-
 def draw_landmarks_pil(img: Image.Image, hand_landmarks) -> Image.Image:
-    """
-    Draws landmark points and simple connections using PIL (no OpenCV).
-    """
+    """Draw landmark points and connections using PIL (no OpenCV)."""
     draw = ImageDraw.Draw(img)
     w, h = img.size
 
-    # Connections from MediaPipe (pairs of landmark indices)
     connections = list(mp_hands.HAND_CONNECTIONS)
 
     # Draw connections
@@ -145,7 +220,6 @@ def draw_landmarks_pil(img: Image.Image, hand_landmarks) -> Image.Image:
 
     return img
 
-
 # -----------------------------
 # Camera input (snapshot)
 # -----------------------------
@@ -158,16 +232,21 @@ if camera_file is None:
 
 # Read image
 img = Image.open(camera_file).convert("RGB")
-img_np = np.array(img)
+img_np = np.ascontiguousarray(np.array(img))
 
 # Run MediaPipe
-results = hands.process(img_np)
+try:
+    results = hands.process(img_np)
+except Exception as e:
+    st.error(f"MediaPipe processing failed: {e}")
+    if debug_mode:
+        st.code(traceback.format_exc())
+    st.stop()
 
 label, conf = "NO_HAND", 0.0
 
 if results.multi_hand_landmarks:
     hand_lms = results.multi_hand_landmarks[0]
-
     feats = landmarks_to_features(hand_lms)
 
     if MODEL is not None:
@@ -177,6 +256,8 @@ if results.multi_hand_landmarks:
 
     if show_landmarks:
         img = draw_landmarks_pil(img, hand_lms)
+else:
+    st.warning("No hand detected. Try brighter light and keep the full hand in frame.")
 
 col1, col2 = st.columns([2, 1])
 
