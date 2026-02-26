@@ -2,3 +2,4 @@ streamlit
 numpy
 pillow
 mediapipe==0.10.32
+scikit-learn
