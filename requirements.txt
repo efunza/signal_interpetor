@@ -1,5 +1,5 @@
 streamlit
 numpy
 pillow
-mediapipe==0.10.30
+mediapipe==0.10.29
 scikit-learn
