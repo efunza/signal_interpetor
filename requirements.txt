@@ -1,5 +1,4 @@
-streamlit>=1.32.0
-mediapipe>=0.10.14
+streamlit
 numpy
 pillow
-scikit-learn
+mediapipe==0.10.32
