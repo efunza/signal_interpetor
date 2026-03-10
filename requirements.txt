@@ -1,7 +1,7 @@
 streamlit
+streamlit-webrtc
+av
+opencv-python-headless
+mediapipe
 numpy
-pillow
 pandas
-mediapipe==0.10.21
-scikit-learn
-opencv-python-headless==4.9.0.80
