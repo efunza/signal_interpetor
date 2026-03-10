@@ -1,5 +1,10 @@
-import threading
+import os
+import io
+import time
+import base64
 import pickle
+import tempfile
+import threading
 from datetime import datetime
 from typing import Optional, Tuple, List
 
@@ -9,7 +14,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import mediapipe as mp
-import streamlit.components.v1 as components
+from gtts import gTTS
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
 
@@ -78,7 +83,6 @@ SIGN_DESCRIPTIONS = {
 
 mp_hands = mp.solutions.hands
 
-
 # -----------------------------
 # Session state
 # -----------------------------
@@ -94,6 +98,11 @@ if "last_spoken_label" not in st.session_state:
 if "last_auto_added_label" not in st.session_state:
     st.session_state.last_auto_added_label = ""
 
+if "audio_bytes" not in st.session_state:
+    st.session_state.audio_bytes = None
+
+if "audio_nonce" not in st.session_state:
+    st.session_state.audio_nonce = 0
 
 # -----------------------------
 # Styling
@@ -172,6 +181,52 @@ def load_model(file) -> Optional[object]:
     except Exception as e:
         st.sidebar.error(f"Model load error: {e}")
         return None
+
+
+# -----------------------------
+# Speech helpers
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def tts_bytes(text: str, lang: str = "en") -> bytes:
+    """
+    Generate MP3 bytes using gTTS.
+    """
+    fp = io.BytesIO()
+    tts = gTTS(text=text, lang=lang)
+    tts.write_to_fp(fp)
+    fp.seek(0)
+    return fp.read()
+
+
+def queue_speech(text: str):
+    if not text:
+        return
+    try:
+        st.session_state.audio_bytes = tts_bytes(text)
+        st.session_state.audio_nonce += 1
+    except Exception as e:
+        st.warning(f"Speech generation failed: {e}")
+
+
+def render_audio_player():
+    """
+    Renders an auto-playing audio tag when audio exists.
+    """
+    audio_bytes = st.session_state.get("audio_bytes")
+    if not audio_bytes:
+        return
+
+    b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    nonce = st.session_state.get("audio_nonce", 0)
+
+    st.markdown(
+        f"""
+        <audio id="tts-player-{nonce}" autoplay controls style="width:100%;">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mpeg">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------
@@ -260,24 +315,6 @@ def add_samples_to_dataset(label: str, feats: np.ndarray, n: int):
     return False
 
 
-def speak_text(text: str):
-    if not text:
-        return
-    safe = text.replace("\\", "\\\\").replace("'", "\\'")
-    components.html(
-        f"""
-        <script>
-            const msg = new SpeechSynthesisUtterance('{safe}');
-            msg.rate = 0.95;
-            msg.pitch = 1.0;
-            window.speechSynthesis.cancel();
-            window.speechSynthesis.speak(msg);
-        </script>
-        """,
-        height=0,
-    )
-
-
 def maybe_add_to_history(label: str):
     if label in ["NO_HAND", "UNKNOWN"]:
         return
@@ -310,7 +347,6 @@ class SignVideoProcessor(VideoProcessorBase):
     def recv(self, frame):
         image = frame.to_ndarray(format="bgr24")
         image = cv2.resize(image, (FRAME_WIDTH, FRAME_HEIGHT))
-
         self.frame_count += 1
 
         if self.frame_count % self.process_every_n == 0:
@@ -336,10 +372,6 @@ class SignVideoProcessor(VideoProcessorBase):
                 self.last_label = label
                 self.last_conf = conf
                 self.last_features = features
-        else:
-            with self.lock:
-                label = self.last_label
-                conf = self.last_conf
 
         cv2.putText(
             image,
@@ -415,6 +447,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+render_audio_player()
+
 tab1, tab2, tab3 = st.tabs(["🎥 Live Interpret", "📘 Learn Signs", "🧪 Data Collection"])
 
 # -----------------------------
@@ -462,7 +496,8 @@ with tab1:
 
         current_sentence = sentence_text(st.session_state.history)
         if current_sentence and st.button("🔊 Speak phrase", use_container_width=True):
-            speak_text(current_sentence)
+            queue_speech(current_sentence)
+            st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -480,7 +515,7 @@ with tab1:
             if label_out != st.session_state.last_auto_added_label:
                 maybe_add_to_history(label_out)
                 st.session_state.last_auto_added_label = label_out
-        elif label_out in ["NO_HAND", "UNKNOWN"]:
+        else:
             st.session_state.last_auto_added_label = ""
 
     with col1:
@@ -492,15 +527,17 @@ with tab1:
     with col4:
         if st.button("🔊 Speak current sign", use_container_width=True):
             if label_out not in ["NO_HAND", "UNKNOWN"]:
-                speak_text(label_out)
+                queue_speech(label_out)
+                st.rerun()
 
     st.caption("Tip: Good lighting, plain background, and keeping one hand centered will improve results.")
 
     if auto_speak:
         if label_out not in ["NO_HAND", "UNKNOWN"]:
             if label_out != st.session_state.last_spoken_label:
-                speak_text(label_out)
+                queue_speech(label_out)
                 st.session_state.last_spoken_label = label_out
+                st.rerun()
         else:
             st.session_state.last_spoken_label = ""
 
