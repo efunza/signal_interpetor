@@ -1,21 +1,23 @@
-import gc
+import threading
 import pickle
 from datetime import datetime
 from typing import Optional, Tuple, List
 
+import av
+import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw
 import mediapipe as mp
 import streamlit.components.v1 as components
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
 
 # -----------------------------
 # App config
 # -----------------------------
 st.set_page_config(
-    page_title="RibeSign AI",
+    page_title="RibeSign AI Live",
     page_icon="🤟",
     layout="wide",
 )
@@ -28,8 +30,8 @@ APP_TAGLINE = "Kenya Sign Language Interpreter"
 APP_SUBTEXT = "Built by Ribe Boys Senior School"
 
 MAX_DATASET_ROWS = 3000
-MAX_IMAGE_SIZE = 640
-MAX_PREVIEW_ROWS = 50
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
 
 KSL_SIGNS = [
     "HELLO", "THANK_YOU", "PLEASE", "HELP", "STOP", "YES", "NO", "LOVE", "OK", "YOU",
@@ -76,7 +78,6 @@ SIGN_DESCRIPTIONS = {
 
 mp_hands = mp.solutions.hands
 
-
 # -----------------------------
 # Session state
 # -----------------------------
@@ -86,6 +87,11 @@ if "dataset_rows" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []
 
+if "speak_queue" not in st.session_state:
+    st.session_state.speak_queue = ""
+
+if "last_added_label" not in st.session_state:
+    st.session_state.last_added_label = ""
 
 # -----------------------------
 # Styling
@@ -138,16 +144,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # -----------------------------
 # Cached resources
 # -----------------------------
 @st.cache_resource
 def get_hands():
     return mp_hands.Hands(
-        static_image_mode=True,
+        static_image_mode=False,
         max_num_hands=1,
         min_detection_confidence=0.6,
+        min_tracking_confidence=0.6,
     )
 
 
@@ -156,9 +162,6 @@ def load_model_bytes(file_bytes: bytes):
     return pickle.loads(file_bytes)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def load_model(file) -> Optional[object]:
     if file is None:
         return None
@@ -169,12 +172,9 @@ def load_model(file) -> Optional[object]:
         return None
 
 
-def resize_image_for_inference(img: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> Image.Image:
-    img = img.copy()
-    img.thumbnail((max_size, max_size))
-    return img
-
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def landmarks_to_features(hand_landmarks) -> np.ndarray:
     pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32)
     pts -= pts[0]
@@ -229,24 +229,22 @@ def demo_gesture(hand_landmarks) -> Tuple[str, float]:
     return "UNKNOWN", 0.40
 
 
-def draw_landmarks_pil(img: Image.Image, hand_landmarks) -> Image.Image:
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
+def draw_landmarks_cv2(image_bgr, hand_landmarks):
+    h, w, _ = image_bgr.shape
 
     for a, b in list(mp_hands.HAND_CONNECTIONS):
-        ax = hand_landmarks.landmark[a].x * w
-        ay = hand_landmarks.landmark[a].y * h
-        bx = hand_landmarks.landmark[b].x * w
-        by = hand_landmarks.landmark[b].y * h
-        draw.line([(ax, ay), (bx, by)], width=3)
+        ax = int(hand_landmarks.landmark[a].x * w)
+        ay = int(hand_landmarks.landmark[a].y * h)
+        bx = int(hand_landmarks.landmark[b].x * w)
+        by = int(hand_landmarks.landmark[b].y * h)
+        cv2.line(image_bgr, (ax, ay), (bx, by), (0, 255, 255), 2)
 
     for lm in hand_landmarks.landmark:
-        x = lm.x * w
-        y = lm.y * h
-        r = 5
-        draw.ellipse([(x - r, y - r), (x + r, y + r)])
+        x = int(lm.x * w)
+        y = int(lm.y * h)
+        cv2.circle(image_bgr, (x, y), 4, (255, 0, 0), -1)
 
-    return img
+    return image_bgr
 
 
 def add_samples_to_dataset(label: str, feats: np.ndarray, n: int):
@@ -254,12 +252,10 @@ def add_samples_to_dataset(label: str, feats: np.ndarray, n: int):
     for _ in range(n):
         st.session_state.dataset_rows.append({"label": label, **base})
 
-    trimmed = False
     if len(st.session_state.dataset_rows) > MAX_DATASET_ROWS:
         st.session_state.dataset_rows = st.session_state.dataset_rows[-MAX_DATASET_ROWS:]
-        trimmed = True
-
-    return trimmed
+        return True
+    return False
 
 
 def speak_text(text: str):
@@ -290,13 +286,85 @@ def sentence_text(items: List[str]) -> str:
 
 
 # -----------------------------
+# Video processor
+# -----------------------------
+class SignVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.hands = get_hands()
+        self.model = None
+        self.conf_thresh = 0.6
+        self.show_landmarks = True
+
+        self.last_label = "NO_HAND"
+        self.last_conf = 0.0
+        self.last_features = None
+
+        self.lock = threading.Lock()
+        self.frame_count = 0
+        self.process_every_n = 2
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+        image = cv2.resize(image, (FRAME_WIDTH, FRAME_HEIGHT))
+
+        self.frame_count += 1
+
+        label = self.last_label
+        conf = self.last_conf
+        features = self.last_features
+
+        if self.frame_count % self.process_every_n == 0:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = self.hands.process(rgb)
+
+            label, conf = "NO_HAND", 0.0
+            features = None
+
+            if results.multi_hand_landmarks:
+                hand_lms = results.multi_hand_landmarks[0]
+                features = landmarks_to_features(hand_lms)
+
+                if self.model is not None:
+                    label, conf = predict_with_model(self.model, features, self.conf_thresh)
+                else:
+                    label, conf = demo_gesture(hand_lms)
+
+                if self.show_landmarks:
+                    image = draw_landmarks_cv2(image, hand_lms)
+            else:
+                label, conf = "NO_HAND", 0.0
+
+            with self.lock:
+                self.last_label = label
+                self.last_conf = conf
+                self.last_features = features
+        else:
+            with self.lock:
+                label = self.last_label
+                conf = self.last_conf
+
+        cv2.putText(
+            image,
+            f"{label} ({conf:.2f})",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+
+# -----------------------------
 # Sidebar
 # -----------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
 
     show_landmarks = st.toggle("Draw hand landmarks", value=True)
-    auto_speak = st.toggle("Speak prediction aloud", value=True)
+    auto_speak = st.toggle("Speak prediction aloud", value=False)
     append_history = st.toggle("Build phrase from predictions", value=True)
     clear_unknowns = st.toggle("Ignore UNKNOWN in phrase", value=True)
 
@@ -325,16 +393,10 @@ with st.sidebar:
     if collect_mode and len(st.session_state.dataset_rows) >= MAX_DATASET_ROWS:
         st.warning("Dataset memory cap reached. Old samples will be replaced by newer ones.")
 
-
-# -----------------------------
-# Resources
-# -----------------------------
-hands = get_hands()
 MODEL = load_model(model_file)
 
-
 # -----------------------------
-# Header / Hero
+# Header
 # -----------------------------
 st.markdown(
     f"""
@@ -343,7 +405,7 @@ st.markdown(
         <p>{APP_TAGLINE}</p>
         <p><strong>{APP_SUBTEXT}</strong></p>
         <div>
-            <span class="pill">Camera-based sign detection</span>
+            <span class="pill">Live webcam interpretation</span>
             <span class="pill">Text output</span>
             <span class="pill">Speech output</span>
             <span class="pill">Student-built innovation</span>
@@ -353,19 +415,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3 = st.tabs(["🎥 Interpret", "📘 Learn Signs", "🧪 Data Collection"])
-
+tab1, tab2, tab3 = st.tabs(["🎥 Live Interpret", "📘 Learn Signs", "🧪 Data Collection"])
 
 # -----------------------------
-# Tab 1: Interpret
+# Tab 1: Live Interpret
 # -----------------------------
 with tab1:
-    left, right = st.columns([1.45, 1])
+    left, right = st.columns([1.6, 1])
 
     with left:
-        st.subheader("Use your camera")
-        st.caption("Take a clear picture of a hand sign to interpret it.")
-        camera_file = st.camera_input("Capture sign")
+        st.subheader("Live camera")
+        st.caption("Allow webcam access, then show one hand sign clearly.")
+
+        ctx = webrtc_streamer(
+            key="ribesign-live",
+            video_processor_factory=SignVideoProcessor,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+        if ctx.video_processor:
+            ctx.video_processor.model = MODEL
+            ctx.video_processor.conf_thresh = conf_thresh
+            ctx.video_processor.show_landmarks = show_landmarks
 
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -375,76 +447,53 @@ with tab1:
 
         c1, c2 = st.columns(2)
         with c1:
+            if st.button("➕ Add current sign", use_container_width=True):
+                if ctx.video_processor:
+                    label_now = ctx.video_processor.last_label
+                    if not (clear_unknowns and label_now == "UNKNOWN"):
+                        maybe_add_to_history(label_now)
+                        st.session_state.last_added_label = label_now
+                        st.rerun()
+
+        with c2:
             if st.button("🗑 Reset phrase", use_container_width=True):
                 st.session_state.history = []
                 st.rerun()
-        with c2:
-            if current_sentence and st.button("🔊 Speak phrase", use_container_width=True):
-                speak_text(current_sentence)
+
+        if current_sentence and st.button("🔊 Speak phrase", use_container_width=True):
+            speak_text(current_sentence)
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-    img = None
-    feats = None
-    label_out, conf_out = "NO_HAND", 0.0
+    st.markdown("### Live Results")
+    col1, col2, col3 = st.columns(3)
 
-    if camera_file is not None:
-        img = Image.open(camera_file).convert("RGB")
-        img = resize_image_for_inference(img, MAX_IMAGE_SIZE)
+    label_out, conf_out, feats = "NO_HAND", 0.0, None
+    if ctx.video_processor:
+        label_out = ctx.video_processor.last_label
+        conf_out = ctx.video_processor.last_conf
+        feats = ctx.video_processor.last_features
 
-        img_np = np.asarray(img, dtype=np.uint8)
-        results = hands.process(img_np)
-
-        if results.multi_hand_landmarks:
-            hand_lms = results.multi_hand_landmarks[0]
-            feats = landmarks_to_features(hand_lms)
-
-            if MODEL is not None:
-                label_out, conf_out = predict_with_model(MODEL, feats, conf_thresh)
-            else:
-                label_out, conf_out = demo_gesture(hand_lms)
-
-            if show_landmarks:
-                img = draw_landmarks_pil(img, hand_lms)
-
-            if append_history and not (clear_unknowns and label_out == "UNKNOWN"):
-                maybe_add_to_history(label_out)
-        else:
-            st.warning("No hand detected. Try better lighting and keep your full hand in the frame.")
-
-        del img_np
-        del results
-        gc.collect()
-
-    view_col, result_col = st.columns([1.5, 1])
-
-    with view_col:
-        if img is None:
-            st.info("Take a picture to begin.")
-        else:
-            st.image(img, caption="Processed image", use_container_width=True)
-
-    with result_col:
-        st.markdown('<div class="result-box">', unsafe_allow_html=True)
-        st.subheader("Prediction")
+    with col1:
         st.metric("Detected sign", label_out)
+    with col2:
         st.metric("Confidence", f"{conf_out:.2f}")
-        st.caption("Good lighting and a clear background improve detection accuracy.")
+    with col3:
+        st.metric("Phrase length", len(st.session_state.history))
 
-        if st.button("🔊 Speak current sign", use_container_width=True):
-            if label_out not in ["NO_HAND", "UNKNOWN"]:
-                speak_text(label_out)
+    st.caption("Tip: Good lighting, plain background, and keeping one hand centered will improve results.")
 
-        if auto_speak and label_out not in ["NO_HAND", "UNKNOWN"] and camera_file is not None:
+    if auto_speak and label_out not in ["NO_HAND", "UNKNOWN"]:
+        if st.session_state.speak_queue != label_out:
+            st.session_state.speak_queue = label_out
             speak_text(label_out)
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
     if collect_mode:
         st.divider()
         st.subheader("Training Data Controls")
 
         if feats is None:
-            st.info("Capture a hand sign first before saving training samples.")
+            st.info("Start the webcam and show a detectable sign before saving samples.")
         else:
             c1, c2, c3 = st.columns([1.1, 1.1, 2])
 
@@ -462,7 +511,6 @@ with tab1:
             with c2:
                 if st.button("🗑 Clear dataset", use_container_width=True):
                     st.session_state.dataset_rows = []
-                    gc.collect()
                     st.warning("Dataset cleared.")
 
             with c3:
@@ -482,10 +530,6 @@ with tab1:
                         mime="text/csv",
                         use_container_width=True,
                     )
-
-                    del df
-                    gc.collect()
-
 
 # -----------------------------
 # Tab 2: Learn Signs
@@ -513,7 +557,6 @@ with tab2:
             st.write(SIGN_DESCRIPTIONS.get(sign, "Supported sign target"))
             st.markdown("</div>", unsafe_allow_html=True)
 
-
 # -----------------------------
 # Tab 3: Data Collection
 # -----------------------------
@@ -521,14 +564,15 @@ with tab3:
     st.subheader("Build and improve the model")
     st.markdown(
         """
-        This app can also be used to collect sign samples for training a more accurate classifier.
+        This app can also be used to collect live sign samples for training a more accurate classifier.
 
         **Suggested workflow**
         1. Turn on **Enable data collection** in the sidebar  
-        2. Choose a target label  
-        3. Capture many examples in different lighting and angles  
-        4. Download the CSV  
-        5. Train a classifier and upload the `.pkl` model back into the app
+        2. Start the webcam  
+        3. Choose a target label  
+        4. Hold the sign clearly and save samples  
+        5. Download the CSV  
+        6. Train a classifier and upload the `.pkl` model back into the app
         """
     )
 
@@ -536,11 +580,8 @@ with tab3:
     st.metric("Collected samples in session", total)
 
     if total > 0:
-        df_preview = pd.DataFrame(st.session_state.dataset_rows).head(MAX_PREVIEW_ROWS)
+        df_preview = pd.DataFrame(st.session_state.dataset_rows).head(50)
         st.dataframe(df_preview, use_container_width=True)
-        del df_preview
-        gc.collect()
-
 
 # -----------------------------
 # Footer
@@ -551,14 +592,14 @@ st.markdown(
     """
 **RibeSign AI** is a school technology project for sign interpretation using computer vision.
 
-**Pipeline:** Camera snapshot → MediaPipe hand landmarks → 63 normalized features → classifier → sign label → optional speech.
+**Pipeline:** Live webcam → MediaPipe hand landmarks → 63 normalized features → classifier → sign label → optional speech.
 
 **Developed by:** **Ribe Boys Senior School**
 
 **Current limitations**
-- Snapshot-based input instead of continuous live video
 - Single-hand detection only
 - No facial expressions or grammar recognition
 - Demo fallback rules are limited compared to a full trained model
+- True sign language recognition works better with motion-based sequence models
 """
 )
