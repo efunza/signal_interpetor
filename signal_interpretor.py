@@ -78,6 +78,7 @@ SIGN_DESCRIPTIONS = {
 
 mp_hands = mp.solutions.hands
 
+
 # -----------------------------
 # Session state
 # -----------------------------
@@ -87,11 +88,12 @@ if "dataset_rows" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []
 
-if "speak_queue" not in st.session_state:
-    st.session_state.speak_queue = ""
+if "last_spoken_label" not in st.session_state:
+    st.session_state.last_spoken_label = ""
 
-if "last_added_label" not in st.session_state:
-    st.session_state.last_added_label = ""
+if "last_auto_added_label" not in st.session_state:
+    st.session_state.last_auto_added_label = ""
+
 
 # -----------------------------
 # Styling
@@ -259,6 +261,8 @@ def add_samples_to_dataset(label: str, feats: np.ndarray, n: int):
 
 
 def speak_text(text: str):
+    if not text:
+        return
     safe = text.replace("\\", "\\\\").replace("'", "\\'")
     components.html(
         f"""
@@ -309,10 +313,6 @@ class SignVideoProcessor(VideoProcessorBase):
 
         self.frame_count += 1
 
-        label = self.last_label
-        conf = self.last_conf
-        features = self.last_features
-
         if self.frame_count % self.process_every_n == 0:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = self.hands.process(rgb)
@@ -331,8 +331,6 @@ class SignVideoProcessor(VideoProcessorBase):
 
                 if self.show_landmarks:
                     image = draw_landmarks_cv2(image, hand_lms)
-            else:
-                label, conf = "NO_HAND", 0.0
 
             with self.lock:
                 self.last_label = label
@@ -345,7 +343,7 @@ class SignVideoProcessor(VideoProcessorBase):
 
         cv2.putText(
             image,
-            f"{label} ({conf:.2f})",
+            f"{self.last_label} ({self.last_conf:.2f})",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
@@ -365,6 +363,7 @@ with st.sidebar:
 
     show_landmarks = st.toggle("Draw hand landmarks", value=True)
     auto_speak = st.toggle("Speak prediction aloud", value=False)
+    auto_add_phrase = st.toggle("Auto add stable signs to phrase", value=False)
     append_history = st.toggle("Build phrase from predictions", value=True)
     clear_unknowns = st.toggle("Ignore UNKNOWN in phrase", value=True)
 
@@ -388,6 +387,7 @@ with st.sidebar:
     st.divider()
     if st.button("🧹 Clear phrase/history", use_container_width=True):
         st.session_state.history = []
+        st.session_state.last_auto_added_label = ""
         st.rerun()
 
     if collect_mode and len(st.session_state.dataset_rows) >= MAX_DATASET_ROWS:
@@ -450,23 +450,24 @@ with tab1:
             if st.button("➕ Add current sign", use_container_width=True):
                 if ctx.video_processor:
                     label_now = ctx.video_processor.last_label
-                    if not (clear_unknowns and label_now == "UNKNOWN"):
+                    if label_now not in ["NO_HAND", "UNKNOWN"]:
                         maybe_add_to_history(label_now)
-                        st.session_state.last_added_label = label_now
                         st.rerun()
 
         with c2:
             if st.button("🗑 Reset phrase", use_container_width=True):
                 st.session_state.history = []
+                st.session_state.last_auto_added_label = ""
                 st.rerun()
 
+        current_sentence = sentence_text(st.session_state.history)
         if current_sentence and st.button("🔊 Speak phrase", use_container_width=True):
             speak_text(current_sentence)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Live Results")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     label_out, conf_out, feats = "NO_HAND", 0.0, None
     if ctx.video_processor:
@@ -474,19 +475,34 @@ with tab1:
         conf_out = ctx.video_processor.last_conf
         feats = ctx.video_processor.last_features
 
+    if auto_add_phrase and append_history:
+        if label_out not in ["NO_HAND", "UNKNOWN"]:
+            if label_out != st.session_state.last_auto_added_label:
+                maybe_add_to_history(label_out)
+                st.session_state.last_auto_added_label = label_out
+        elif label_out in ["NO_HAND", "UNKNOWN"]:
+            st.session_state.last_auto_added_label = ""
+
     with col1:
         st.metric("Detected sign", label_out)
     with col2:
         st.metric("Confidence", f"{conf_out:.2f}")
     with col3:
         st.metric("Phrase length", len(st.session_state.history))
+    with col4:
+        if st.button("🔊 Speak current sign", use_container_width=True):
+            if label_out not in ["NO_HAND", "UNKNOWN"]:
+                speak_text(label_out)
 
     st.caption("Tip: Good lighting, plain background, and keeping one hand centered will improve results.")
 
-    if auto_speak and label_out not in ["NO_HAND", "UNKNOWN"]:
-        if st.session_state.speak_queue != label_out:
-            st.session_state.speak_queue = label_out
-            speak_text(label_out)
+    if auto_speak:
+        if label_out not in ["NO_HAND", "UNKNOWN"]:
+            if label_out != st.session_state.last_spoken_label:
+                speak_text(label_out)
+                st.session_state.last_spoken_label = label_out
+        else:
+            st.session_state.last_spoken_label = ""
 
     if collect_mode:
         st.divider()
