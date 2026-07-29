@@ -223,7 +223,7 @@ def _secret(name: str) -> Optional[str]:
     return st.secrets.get(name, os.environ.get(name))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_ice_servers() -> list:
     """
     Returns WebRTC ICE servers for the video call the browser opens to this
@@ -634,20 +634,30 @@ with tab1:
         st.caption("Allow webcam access, then show one hand sign clearly.")
 
         ice_servers = get_ice_servers()
-
-        has_turn = any(
-            any(
-                url.startswith("turn:")
-                for url in (server["urls"] if isinstance(server["urls"], list) else [server["urls"]])
-            )
-            for server in ice_servers
-        )
-
-        if not has_turn:
+        if ice_servers == _STUN_ONLY_FALLBACK:
             st.sidebar.warning(
                 "No TURN server configured - the webcam connection may fail to establish "
-                "for visitors outside your local network."
+                "for visitors outside your local network. See the get_ice_servers() "
+                "docstring for free/self-hosted setup options."
             )
+            with st.sidebar.expander("TURN diagnostics"):
+                st.write(
+                    {
+                        "TURN_URLS detected": bool(_secret("TURN_URLS")),
+                        "TURN_USERNAME detected": bool(_secret("TURN_USERNAME")),
+                        "TURN_CREDENTIAL detected": bool(_secret("TURN_CREDENTIAL")),
+                        "METERED_DOMAIN detected": bool(_secret("METERED_DOMAIN")),
+                        "METERED_API_KEY detected": bool(_secret("METERED_API_KEY")),
+                    }
+                )
+                st.caption(
+                    "'detected' means the app found a non-empty value for that secret - it "
+                    "doesn't confirm the value is correct. If METERED_DOMAIN/METERED_API_KEY "
+                    "both show True here but the connection still fails, the credentials "
+                    "themselves are likely wrong or the fetch to Metered failed silently - "
+                    "check the app logs (Manage app -> Logs) for a 'Could not fetch Metered "
+                    "ICE servers' line."
+                )
 
         ctx = webrtc_streamer(
             key="ribesign-live",
@@ -846,4 +856,3 @@ st.markdown(
 - Models must be exported with `skops` rather than `pickle` for security reasons
 """
 )
-
