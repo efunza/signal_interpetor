@@ -2,7 +2,10 @@ streamlit>=1.36
 streamlit-webrtc>=0.47
 av>=11.0
 opencv-python-headless>=4.9
-mediapipe>=0.10
+# Pinned below 0.10.30: that release removed the legacy `mp.solutions` API
+# (mp.solutions.hands) that this app uses. See:
+# https://github.com/google-ai-edge/mediapipe/issues/6192
+mediapipe>=0.10.14,<0.10.30
 numpy>=1.26
 pandas>=2.2
 gTTS>=2.5
