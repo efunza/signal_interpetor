@@ -1,10 +1,7 @@
-import os
 import io
-import time
 import base64
-import pickle
-import tempfile
 import threading
+from collections import deque, Counter
 from datetime import datetime
 from typing import Optional, Tuple, List
 
@@ -14,6 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import mediapipe as mp
+import skops.io as sio
 from gtts import gTTS
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
@@ -37,6 +35,15 @@ APP_SUBTEXT = "Built by Ribe Boys Senior School"
 MAX_DATASET_ROWS = 3000
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+NEUTRAL_LABELS = ("NO_HAND", "UNKNOWN")
+
+# Public STUN server so the webcam connection can traverse NAT once this is
+# deployed off localhost (e.g. Streamlit Community Cloud, a school network).
+# For flaky networks a TURN server is more reliable but requires your own
+# credentials - see https://github.com/whitphx/streamlit-webrtc#deployment
+RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+
+TTS_LANGUAGES = {"English": "en", "Kiswahili": "sw"}
 
 KSL_SIGNS = [
     "HELLO", "THANK_YOU", "PLEASE", "HELP", "STOP", "YES", "NO", "LOVE", "OK", "YOU",
@@ -86,23 +93,17 @@ mp_hands = mp.solutions.hands
 # -----------------------------
 # Session state
 # -----------------------------
-if "dataset_rows" not in st.session_state:
-    st.session_state.dataset_rows = []
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "last_spoken_label" not in st.session_state:
-    st.session_state.last_spoken_label = ""
-
-if "last_auto_added_label" not in st.session_state:
-    st.session_state.last_auto_added_label = ""
-
-if "audio_bytes" not in st.session_state:
-    st.session_state.audio_bytes = None
-
-if "audio_nonce" not in st.session_state:
-    st.session_state.audio_nonce = 0
+DEFAULTS = {
+    "dataset_rows": [],
+    "history": [],
+    "last_spoken_label": "",
+    "last_auto_added_label": "",
+    "audio_bytes": None,
+    "audio_nonce": 0,
+}
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 # -----------------------------
 # Styling
@@ -150,6 +151,16 @@ st.markdown(
             border: 1px solid rgba(6,182,212,0.25);
             background: rgba(6,182,212,0.08);
         }
+        .demo-badge {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            background: rgba(234,179,8,0.18);
+            color: #92400e;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -170,7 +181,30 @@ def get_hands():
 
 @st.cache_resource
 def load_model_bytes(file_bytes: bytes):
-    return pickle.loads(file_bytes)
+    """
+    Safely deserialize a trained classifier.
+
+    IMPORTANT: this deliberately does NOT use pickle.loads(). Unpickling
+    bytes from a user-uploaded file executes arbitrary code embedded in the
+    file (pickle's __reduce__ mechanism) - it is a remote code execution
+    vulnerability, not just a data-format risk. skops.io.loads() only
+    reconstructs objects from an allow-listed set of safe types, so an
+    uploaded model that references anything else is rejected instead of
+    silently executed.
+
+    To produce a compatible file, train your classifier as usual and save
+    it with:
+        import skops.io as sio
+        sio.dump(model, "model.skops")
+    instead of pickle.dump(...).
+    """
+    untrusted = sio.get_untrusted_types(data=file_bytes)
+    if untrusted:
+        raise ValueError(
+            "Model file references untrusted object types and was rejected: "
+            + ", ".join(untrusted)
+        )
+    return sio.loads(file_bytes)
 
 
 def load_model(file) -> Optional[object]:
@@ -189,7 +223,10 @@ def load_model(file) -> Optional[object]:
 @st.cache_data(show_spinner=False)
 def tts_bytes(text: str, lang: str = "en") -> bytes:
     """
-    Generate MP3 bytes using gTTS.
+    Generate MP3 bytes using gTTS. Cached per (text, lang) so repeated
+    phrases (greetings, digits, common signs) don't re-hit the network on
+    every rerun - this also means the app needs internet access the first
+    time each phrase is spoken.
     """
     fp = io.BytesIO()
     tts = gTTS(text=text, lang=lang)
@@ -198,14 +235,17 @@ def tts_bytes(text: str, lang: str = "en") -> bytes:
     return fp.read()
 
 
-def queue_speech(text: str):
+def queue_speech(text: str, lang: str = "en"):
     if not text:
         return
     try:
-        st.session_state.audio_bytes = tts_bytes(text)
+        st.session_state.audio_bytes = tts_bytes(text, lang)
         st.session_state.audio_nonce += 1
     except Exception as e:
-        st.warning(f"Speech generation failed: {e}")
+        st.warning(
+            f"Speech generation failed ({e}). This usually means no internet "
+            "connection is available - gTTS requires one."
+        )
 
 
 def render_audio_player():
@@ -315,8 +355,10 @@ def add_samples_to_dataset(label: str, feats: np.ndarray, n: int):
     return False
 
 
-def maybe_add_to_history(label: str):
-    if label in ["NO_HAND", "UNKNOWN"]:
+def maybe_add_to_history(label: str, skip_unknown: bool = True):
+    if label == "NO_HAND":
+        return
+    if skip_unknown and label == "UNKNOWN":
         return
     if not st.session_state.history or st.session_state.history[-1] != label:
         st.session_state.history.append(label)
@@ -330,30 +372,67 @@ def sentence_text(items: List[str]) -> str:
 # Video processor
 # -----------------------------
 class SignVideoProcessor(VideoProcessorBase):
+    """
+    Runs on a background thread managed by streamlit-webrtc. Two things to
+    keep in mind when touching this class:
+
+    1. Anything read on the main Streamlit thread (label/confidence/features)
+       must go through get_last(), which holds the same lock recv() writes
+       under. Reading the bare attributes directly - as the original app did
+       - is a data race: the main thread can observe a label from one frame
+         paired with features from another.
+    2. Settings (model, threshold, smoothing window, etc.) are plain
+       attributes set from the main thread each rerun; that's fine to leave
+       unlocked since they're simple, independently-meaningful values, not a
+       tuple that needs to stay consistent with itself.
+    """
+
     def __init__(self):
         self.hands = get_hands()
         self.model = None
         self.conf_thresh = 0.6
         self.show_landmarks = True
+        self.process_every_n = 2
+        self.smoothing_window = 5
 
         self.last_label = "NO_HAND"
         self.last_conf = 0.0
         self.last_features = None
 
+        self._recent_labels = deque(maxlen=self.smoothing_window)
         self.lock = threading.Lock()
         self.frame_count = 0
-        self.process_every_n = 2
+
+    def get_last(self):
+        with self.lock:
+            return self.last_label, self.last_conf, self.last_features
+
+    def _smoothed_label(self, raw_label: str) -> str:
+        # Resize the deque if the user changed the smoothing window this run.
+        if self._recent_labels.maxlen != self.smoothing_window:
+            self._recent_labels = deque(self._recent_labels, maxlen=self.smoothing_window)
+
+        self._recent_labels.append(raw_label)
+        if len(self._recent_labels) < self._recent_labels.maxlen:
+            return raw_label
+
+        most_common, count = Counter(self._recent_labels).most_common(1)[0]
+        # Require a real majority before committing to a smoothed label,
+        # otherwise fall back to the latest raw reading.
+        if count >= (self._recent_labels.maxlen // 2) + 1:
+            return most_common
+        return raw_label
 
     def recv(self, frame):
         image = frame.to_ndarray(format="bgr24")
         image = cv2.resize(image, (FRAME_WIDTH, FRAME_HEIGHT))
         self.frame_count += 1
 
-        if self.frame_count % self.process_every_n == 0:
+        if self.frame_count % max(self.process_every_n, 1) == 0:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = self.hands.process(rgb)
 
-            label, conf = "NO_HAND", 0.0
+            raw_label, conf = "NO_HAND", 0.0
             features = None
 
             if results.multi_hand_landmarks:
@@ -361,21 +440,24 @@ class SignVideoProcessor(VideoProcessorBase):
                 features = landmarks_to_features(hand_lms)
 
                 if self.model is not None:
-                    label, conf = predict_with_model(self.model, features, self.conf_thresh)
+                    raw_label, conf = predict_with_model(self.model, features, self.conf_thresh)
                 else:
-                    label, conf = demo_gesture(hand_lms)
+                    raw_label, conf = demo_gesture(hand_lms)
 
                 if self.show_landmarks:
                     image = draw_landmarks_cv2(image, hand_lms)
+
+            label = self._smoothed_label(raw_label)
 
             with self.lock:
                 self.last_label = label
                 self.last_conf = conf
                 self.last_features = features
 
+        display_label, display_conf, _ = self.get_last()
         cv2.putText(
             image,
-            f"{self.last_label} ({self.last_conf:.2f})",
+            f"{display_label} ({display_conf:.2f})",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
@@ -398,6 +480,29 @@ with st.sidebar:
     auto_add_phrase = st.toggle("Auto add stable signs to phrase", value=False)
     append_history = st.toggle("Build phrase from predictions", value=True)
     clear_unknowns = st.toggle("Ignore UNKNOWN in phrase", value=True)
+    speech_lang_name = st.selectbox("Speech language", list(TTS_LANGUAGES.keys()))
+    speech_lang = TTS_LANGUAGES[speech_lang_name]
+
+    with st.expander("Performance & smoothing"):
+        process_every_n = st.slider(
+            "Process every Nth frame", 1, 5, 2,
+            help="Higher = less CPU load, lower = more responsive. Raise this on slower laptops.",
+        )
+        smoothing_window = st.slider(
+            "Smoothing window (frames)", 1, 15, 5,
+            help="Majority-vote over this many processed frames before a prediction is treated as stable. "
+                 "Reduces flicker between similar signs.",
+        )
+
+    st.divider()
+    st.subheader("🧠 Optional model")
+    st.caption(
+        "Upload a trained classifier based on 63 hand landmark features, saved with "
+        "`skops.io.dump(model, 'model.skops')` (NOT pickle - pickle files are no longer "
+        "accepted here because loading one can run arbitrary code)."
+    )
+    model_file = st.file_uploader("Upload model", type=["skops"])
+    conf_thresh = st.slider("Minimum confidence", 0.0, 1.0, 0.60, 0.05)
 
     st.divider()
     st.subheader("📚 Training data")
@@ -409,12 +514,6 @@ with st.sidebar:
 
     selected_label = st.selectbox("Label to record", labels, index=0)
     samples_per_click = st.slider("Samples saved per click", 1, 5, 2)
-
-    st.divider()
-    st.subheader("🧠 Optional model (.pkl)")
-    st.caption("Upload a trained classifier based on 63 hand landmark features.")
-    model_file = st.file_uploader("Upload model", type=["pkl"])
-    conf_thresh = st.slider("Minimum confidence", 0.0, 1.0, 0.60, 0.05)
 
     st.divider()
     if st.button("🧹 Clear phrase/history", use_container_width=True):
@@ -459,12 +558,19 @@ with tab1:
 
     with left:
         st.subheader("Live camera")
+        if MODEL is None:
+            st.markdown('<span class="demo-badge">⚠ Demo mode - no trained model loaded</span>', unsafe_allow_html=True)
+            st.caption(
+                "Predictions are coming from a small set of hardcoded heuristic rules, "
+                "not a trained classifier. Upload a `.skops` model in the sidebar for real recognition."
+            )
         st.caption("Allow webcam access, then show one hand sign clearly.")
 
         ctx = webrtc_streamer(
             key="ribesign-live",
             video_processor_factory=SignVideoProcessor,
             media_stream_constraints={"video": True, "audio": False},
+            rtc_configuration=RTC_CONFIGURATION,
             async_processing=True,
         )
 
@@ -472,6 +578,8 @@ with tab1:
             ctx.video_processor.model = MODEL
             ctx.video_processor.conf_thresh = conf_thresh
             ctx.video_processor.show_landmarks = show_landmarks
+            ctx.video_processor.process_every_n = process_every_n
+            ctx.video_processor.smoothing_window = smoothing_window
 
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -483,10 +591,9 @@ with tab1:
         with c1:
             if st.button("➕ Add current sign", use_container_width=True):
                 if ctx.video_processor:
-                    label_now = ctx.video_processor.last_label
-                    if label_now not in ["NO_HAND", "UNKNOWN"]:
-                        maybe_add_to_history(label_now)
-                        st.rerun()
+                    label_now, _, _ = ctx.video_processor.get_last()
+                    maybe_add_to_history(label_now, skip_unknown=clear_unknowns)
+                    st.rerun()
 
         with c2:
             if st.button("🗑 Reset phrase", use_container_width=True):
@@ -496,7 +603,7 @@ with tab1:
 
         current_sentence = sentence_text(st.session_state.history)
         if current_sentence and st.button("🔊 Speak phrase", use_container_width=True):
-            queue_speech(current_sentence)
+            queue_speech(current_sentence, speech_lang)
             st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -506,14 +613,12 @@ with tab1:
 
     label_out, conf_out, feats = "NO_HAND", 0.0, None
     if ctx.video_processor:
-        label_out = ctx.video_processor.last_label
-        conf_out = ctx.video_processor.last_conf
-        feats = ctx.video_processor.last_features
+        label_out, conf_out, feats = ctx.video_processor.get_last()
 
     if auto_add_phrase and append_history:
-        if label_out not in ["NO_HAND", "UNKNOWN"]:
+        if label_out not in NEUTRAL_LABELS:
             if label_out != st.session_state.last_auto_added_label:
-                maybe_add_to_history(label_out)
+                maybe_add_to_history(label_out, skip_unknown=clear_unknowns)
                 st.session_state.last_auto_added_label = label_out
         else:
             st.session_state.last_auto_added_label = ""
@@ -526,16 +631,16 @@ with tab1:
         st.metric("Phrase length", len(st.session_state.history))
     with col4:
         if st.button("🔊 Speak current sign", use_container_width=True):
-            if label_out not in ["NO_HAND", "UNKNOWN"]:
-                queue_speech(label_out)
+            if label_out not in NEUTRAL_LABELS:
+                queue_speech(label_out, speech_lang)
                 st.rerun()
 
     st.caption("Tip: Good lighting, plain background, and keeping one hand centered will improve results.")
 
     if auto_speak:
-        if label_out not in ["NO_HAND", "UNKNOWN"]:
+        if label_out not in NEUTRAL_LABELS:
             if label_out != st.session_state.last_spoken_label:
-                queue_speech(label_out)
+                queue_speech(label_out, speech_lang)
                 st.session_state.last_spoken_label = label_out
                 st.rerun()
         else:
@@ -620,12 +725,13 @@ with tab3:
         This app can also be used to collect live sign samples for training a more accurate classifier.
 
         **Suggested workflow**
-        1. Turn on **Enable data collection** in the sidebar  
-        2. Start the webcam  
-        3. Choose a target label  
-        4. Hold the sign clearly and save samples  
-        5. Download the CSV  
-        6. Train a classifier and upload the `.pkl` model back into the app
+        1. Turn on **Enable data collection** in the sidebar
+        2. Start the webcam
+        3. Choose a target label
+        4. Hold the sign clearly and save samples
+        5. Download the CSV
+        6. Train a classifier and save it with `skops.io.dump(model, "model.skops")`
+        7. Upload the `.skops` file back into the app
         """
     )
 
@@ -645,7 +751,7 @@ st.markdown(
     """
 **RibeSign AI** is a school technology project for sign interpretation using computer vision.
 
-**Pipeline:** Live webcam → MediaPipe hand landmarks → 63 normalized features → classifier → sign label → optional speech.
+**Pipeline:** Live webcam → MediaPipe hand landmarks → 63 normalized features → majority-vote smoothing → classifier → sign label → optional speech.
 
 **Developed by:** **Ribe Boys Senior School**
 
@@ -654,5 +760,7 @@ st.markdown(
 - No facial expressions or grammar recognition
 - Demo fallback rules are limited compared to a full trained model
 - True sign language recognition works better with motion-based sequence models
+- Models must be exported with `skops` rather than `pickle` for security reasons
 """
 )
+
