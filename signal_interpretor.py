@@ -1,4 +1,6 @@
 import io
+import os
+import logging
 import base64
 import threading
 from collections import deque, Counter
@@ -7,6 +9,7 @@ from typing import Optional, Tuple, List
 
 import av
 import cv2
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -14,6 +17,8 @@ import mediapipe as mp
 import skops.io as sio
 from gtts import gTTS
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------
@@ -36,12 +41,6 @@ MAX_DATASET_ROWS = 3000
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 NEUTRAL_LABELS = ("NO_HAND", "UNKNOWN")
-
-# Public STUN server so the webcam connection can traverse NAT once this is
-# deployed off localhost (e.g. Streamlit Community Cloud, a school network).
-# For flaky networks a TURN server is more reliable but requires your own
-# credentials - see https://github.com/whitphx/streamlit-webrtc#deployment
-RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
 TTS_LANGUAGES = {"English": "en", "Kiswahili": "sw"}
 
@@ -215,6 +214,74 @@ def load_model(file) -> Optional[object]:
     except Exception as e:
         st.sidebar.error(f"Model load error: {e}")
         return None
+
+
+_STUN_ONLY_FALLBACK = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+
+def _secret(name: str) -> Optional[str]:
+    return st.secrets.get(name, os.environ.get(name))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_ice_servers() -> list:
+    """
+    Returns WebRTC ICE servers for the video call the browser opens to this
+    app. A STUN server alone lets two peers discover their public address,
+    but many networks - including Streamlit Community Cloud's current setup,
+    and most mobile/carrier-grade NAT connections - block the direct
+    peer-to-peer connection STUN sets up. A TURN server relays the media
+    instead, which works almost everywhere. This checks two ways to get one,
+    in order, before giving up and falling back to STUN-only:
+
+    1. Static TURN credentials (secrets: TURN_URLS, TURN_USERNAME,
+       TURN_CREDENTIAL). TURN_URLS is comma-separated. This works with:
+         - Your own self-hosted coturn server (no third party at all -
+           run `coturn` on any VPS with a public IP, open UDP/TCP 3478 and
+           a relay port range in the firewall, and set a fixed
+           username/password with `lt-cred-mech` in turnserver.conf).
+           Guide: https://github.com/coturn/coturn/wiki/turnserver
+         - Metered.ca's free plan (metered.ca/tools/openrelay/) if you
+           switch its dashboard to "static credentials" mode instead of an
+           API key.
+       Example secrets.toml:
+         TURN_URLS = "turn:your-server.example.com:3478"
+         TURN_USERNAME = "someuser"
+         TURN_CREDENTIAL = "somepassword"
+
+    2. Metered.ca's free-tier dynamic credentials API (20 GB/month free,
+       no credit card required - sign up at metered.ca). Create a TURN app
+       in their dashboard, which gives you a subdomain and an API key.
+       Example secrets.toml:
+         METERED_DOMAIN = "your-subdomain"
+         METERED_API_KEY = "..."
+
+    Neither configured -> falls back to STUN-only, which works for local
+    testing but is likely to fail intermittently once deployed - a warning
+    is shown in the sidebar in that case.
+    """
+    turn_urls = _secret("TURN_URLS")
+    turn_username = _secret("TURN_USERNAME")
+    turn_credential = _secret("TURN_CREDENTIAL")
+    if turn_urls and turn_username and turn_credential:
+        urls = [u.strip() for u in turn_urls.split(",") if u.strip()]
+        return [{"urls": urls, "username": turn_username, "credential": turn_credential}]
+
+    metered_domain = _secret("METERED_DOMAIN")
+    metered_api_key = _secret("METERED_API_KEY")
+    if metered_domain and metered_api_key:
+        try:
+            resp = requests.get(
+                f"https://{metered_domain}.metered.live/api/v1/turn/credentials",
+                params={"apiKey": metered_api_key},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.warning("Could not fetch Metered ICE servers, falling back to STUN-only: %s", e)
+
+    return _STUN_ONLY_FALLBACK
 
 
 # -----------------------------
@@ -566,11 +633,19 @@ with tab1:
             )
         st.caption("Allow webcam access, then show one hand sign clearly.")
 
+        ice_servers = get_ice_servers()
+        if ice_servers == _STUN_ONLY_FALLBACK:
+            st.sidebar.warning(
+                "No TURN server configured - the webcam connection may fail to establish "
+                "for visitors outside your local network. See the get_ice_servers() "
+                "docstring for free/self-hosted setup options."
+            )
+
         ctx = webrtc_streamer(
             key="ribesign-live",
             video_processor_factory=SignVideoProcessor,
             media_stream_constraints={"video": True, "audio": False},
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration={"iceServers": ice_servers},
             async_processing=True,
         )
 
