@@ -9,5 +9,6 @@ mediapipe>=0.10.14,<0.10.30
 numpy>=1.26
 pandas>=2.2
 gTTS>=2.5
+requests>=2.31
 skops>=0.10
 scikit-learn>=1.4
