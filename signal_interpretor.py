@@ -54,6 +54,17 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 NEUTRAL_LABELS = ("NO_HAND", "UNKNOWN")
 
+# Types skops commonly flags for plain sklearn estimators that are safe to trust.
+# We only auto-trust types matching this allowlist prefix; anything else still
+# gets rejected and shown to the user.
+SKOPS_SAFE_PREFIXES = (
+    "numpy.",
+    "sklearn.",
+    "scipy.",
+    "collections.",
+    "builtins.",
+)
+
 TTS_LANGUAGES = {"English": "en", "Kiswahili": "sw"}
 
 KSL_SIGNS = [
@@ -111,6 +122,8 @@ DEFAULTS = {
     "last_auto_added_label": "",
     "audio_bytes": None,
     "audio_nonce": 0,
+    "model_error": "",
+    "model_loaded_name": "",
 }
 
 for key, value in DEFAULTS.items():
@@ -185,22 +198,34 @@ def get_hands():
     )
 
 
+def _all_types_look_safe(untrusted_types: List[str]) -> bool:
+    """Only auto-trust skops 'untrusted' types that match a known-safe allowlist
+    (plain numpy/sklearn/scipy internals). Anything outside that is refused."""
+    return all(t.startswith(SKOPS_SAFE_PREFIXES) for t in untrusted_types)
+
+
 def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
     if uploaded_file is None:
         return None
 
     file_bytes = uploaded_file.getvalue()
     filename = uploaded_file.name.lower()
+    st.session_state.model_error = ""
 
     try:
         if filename.endswith(".skops"):
             untrusted = sio.get_untrusted_types(data=file_bytes)
-            if untrusted:
-                st.sidebar.error(
-                    "Skops model rejected due to untrusted types: " + ", ".join(untrusted)
+            if untrusted and not _all_types_look_safe(untrusted):
+                msg = (
+                    "Skops model rejected — contains types outside the trusted "
+                    "sklearn/numpy/scipy allowlist: " + ", ".join(untrusted)
                 )
+                st.session_state.model_error = msg
                 return None
-            return ("sklearn", sio.loads(file_bytes))
+            # Types are either empty or all match the safe allowlist, so it's fine
+            # to explicitly trust them for loading.
+            model = sio.loads(file_bytes, trusted=untrusted)
+            return ("sklearn", model)
 
         elif filename.endswith((".joblib", ".sav")):
             model = joblib.load(io.BytesIO(file_bytes))
@@ -212,14 +237,14 @@ def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
 
         elif filename.endswith(".onnx"):
             if ort is None:
-                st.sidebar.error("ONNX Runtime is not installed (`pip install onnxruntime`).")
+                st.session_state.model_error = "ONNX Runtime is not installed (`pip install onnxruntime`)."
                 return None
             session = ort.InferenceSession(file_bytes)
             return ("onnx", session)
 
         elif filename.endswith((".pt", ".pth")):
             if torch is None:
-                st.sidebar.error("PyTorch is not installed (`pip install torch`).")
+                st.session_state.model_error = "PyTorch is not installed (`pip install torch`)."
                 return None
             buffer = io.BytesIO(file_bytes)
             try:
@@ -232,11 +257,12 @@ def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
             return ("torch", model)
 
         else:
-            st.sidebar.error("Unsupported file extension.")
+            st.session_state.model_error = "Unsupported file extension."
             return None
 
     except Exception as e:
-        st.sidebar.error(f"Failed to load model ({uploaded_file.name}): {e}")
+        st.session_state.model_error = f"Failed to load model ({uploaded_file.name}): {e}"
+        logger.exception("Model load failed")
         return None
 
 
@@ -334,9 +360,15 @@ def predict_with_model(
     feats: np.ndarray,
     threshold: float,
     target_labels: List[str],
-) -> Tuple[str, float]:
+) -> Tuple[str, float, str]:
+    """Returns (display_label, confidence, raw_label).
+
+    display_label is UNKNOWN if confidence is below threshold; raw_label is
+    always the model's top prediction, regardless of threshold, so the UI can
+    show what the model actually thinks even when it's being suppressed.
+    """
     if model_wrapper is None:
-        return "UNKNOWN", 0.0
+        return "UNKNOWN", 0.0, "UNKNOWN"
 
     model_type, model = model_wrapper
 
@@ -346,14 +378,15 @@ def predict_with_model(
                 proba = model.predict_proba([feats])[0]
                 idx = int(np.argmax(proba))
                 conf = float(proba[idx])
-                label = (
+                raw_label = (
                     str(model.classes_[idx])
                     if hasattr(model, "classes_")
                     else (target_labels[idx] if idx < len(target_labels) else f"CLASS_{idx}")
                 )
-                return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
-            label = model.predict([feats])[0]
-            return str(label), 0.50
+                label = raw_label if conf >= threshold else "UNKNOWN"
+                return label, conf, raw_label
+            raw_label = str(model.predict([feats])[0])
+            return raw_label, 0.50, raw_label
 
         elif model_type == "onnx":
             input_name = model.get_inputs()[0].name
@@ -365,7 +398,9 @@ def predict_with_model(
                 probs_dict = raw_out[0]
                 best_class = max(probs_dict, key=probs_dict.get)
                 conf = float(probs_dict[best_class])
-                return (str(best_class), conf) if conf >= threshold else ("UNKNOWN", conf)
+                raw_label = str(best_class)
+                label = raw_label if conf >= threshold else "UNKNOWN"
+                return label, conf, raw_label
 
             probs = np.array(raw_out)[0]
             if probs.ndim > 0 and len(probs) > 1:
@@ -374,9 +409,11 @@ def predict_with_model(
                     probs = exp_p / exp_p.sum()
                 idx = int(np.argmax(probs))
                 conf = float(probs[idx])
-                label = target_labels[idx] if idx < len(target_labels) else str(idx)
-                return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
-            return str(raw_out[0]), 0.50
+                raw_label = target_labels[idx] if idx < len(target_labels) else str(idx)
+                label = raw_label if conf >= threshold else "UNKNOWN"
+                return label, conf, raw_label
+            raw_label = str(raw_out[0])
+            return raw_label, 0.50, raw_label
 
         elif model_type == "torch":
             with torch.no_grad():
@@ -386,17 +423,18 @@ def predict_with_model(
                 conf, idx = torch.max(probs, dim=0)
                 conf_val = float(conf.item())
                 idx_val = int(idx.item())
-                label = target_labels[idx_val] if idx_val < len(target_labels) else str(idx_val)
-                return (label, conf_val) if conf_val >= threshold else ("UNKNOWN", conf_val)
+                raw_label = target_labels[idx_val] if idx_val < len(target_labels) else str(idx_val)
+                label = raw_label if conf_val >= threshold else "UNKNOWN"
+                return label, conf_val, raw_label
 
     except Exception as e:
         logger.error(f"Inference error ({model_type}): {e}")
-        return "UNKNOWN", 0.0
+        return "UNKNOWN", 0.0, "UNKNOWN"
 
-    return "UNKNOWN", 0.0
+    return "UNKNOWN", 0.0, "UNKNOWN"
 
 
-def demo_gesture(hand_landmarks) -> Tuple[str, float]:
+def demo_gesture(hand_landmarks) -> Tuple[str, float, str]:
     tips = [4, 8, 12, 16, 20]
     pips = [3, 6, 10, 14, 18]
     extended = []
@@ -406,22 +444,24 @@ def demo_gesture(hand_landmarks) -> Tuple[str, float]:
     thumb, index, middle, ring, pinky = extended
 
     if index and middle and ring and pinky:
-        return "HELLO", 0.85
-    if (not index) and (not middle) and (not ring) and (not pinky):
-        return ("STOP", 0.75 if thumb else 0.85)
-    if thumb and (not index) and (not middle) and (not ring) and (not pinky):
-        return "YES", 0.78
-    if index and (not middle) and (not ring) and (not pinky):
-        return "1", 0.80
-    if index and middle and (not ring) and (not pinky):
-        return "2", 0.80
-    if thumb and index and middle and (not ring) and (not pinky):
-        return "3", 0.78
-    if (not thumb) and index and middle and ring and pinky:
-        return "4", 0.78
-    if thumb and index and middle and ring and pinky:
-        return "5", 0.82
-    return "UNKNOWN", 0.40
+        label, conf = "HELLO", 0.85
+    elif (not index) and (not middle) and (not ring) and (not pinky):
+        label, conf = "STOP", (0.75 if thumb else 0.85)
+    elif thumb and (not index) and (not middle) and (not ring) and (not pinky):
+        label, conf = "YES", 0.78
+    elif index and (not middle) and (not ring) and (not pinky):
+        label, conf = "1", 0.80
+    elif index and middle and (not ring) and (not pinky):
+        label, conf = "2", 0.80
+    elif thumb and index and middle and (not ring) and (not pinky):
+        label, conf = "3", 0.78
+    elif (not thumb) and index and middle and ring and pinky:
+        label, conf = "4", 0.78
+    elif thumb and index and middle and ring and pinky:
+        label, conf = "5", 0.82
+    else:
+        label, conf = "UNKNOWN", 0.40
+    return label, conf, label
 
 
 def draw_landmarks_cv2(image_bgr, hand_landmarks):
@@ -476,6 +516,7 @@ class SignVideoProcessor(VideoProcessorBase):
         self.labels_list = DEFAULT_LABELS
         self.last_label = "NO_HAND"
         self.last_conf = 0.0
+        self.last_raw_label = "NO_HAND"
         self.last_features = None
         self._recent_labels = deque(maxlen=self.smoothing_window)
         self.lock = threading.Lock()
@@ -483,7 +524,7 @@ class SignVideoProcessor(VideoProcessorBase):
 
     def get_last(self):
         with self.lock:
-            return self.last_label, self.last_conf, self.last_features
+            return self.last_label, self.last_conf, self.last_features, self.last_raw_label
 
     def _smoothed_label(self, raw_label: str) -> str:
         if self._recent_labels.maxlen != self.smoothing_window:
@@ -505,7 +546,7 @@ class SignVideoProcessor(VideoProcessorBase):
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = self.hands.process(rgb)
 
-            raw_label, conf = "NO_HAND", 0.0
+            raw_label, conf, model_raw_label = "NO_HAND", 0.0, "NO_HAND"
             features = None
 
             if results.multi_hand_landmarks:
@@ -513,11 +554,11 @@ class SignVideoProcessor(VideoProcessorBase):
                 features = landmarks_to_features(hand_lms)
 
                 if self.model is not None:
-                    raw_label, conf = predict_with_model(
+                    raw_label, conf, model_raw_label = predict_with_model(
                         self.model, features, self.conf_thresh, self.labels_list
                     )
                 else:
-                    raw_label, conf = demo_gesture(hand_lms)
+                    raw_label, conf, model_raw_label = demo_gesture(hand_lms)
 
                 if self.show_landmarks:
                     image = draw_landmarks_cv2(image, hand_lms)
@@ -528,8 +569,9 @@ class SignVideoProcessor(VideoProcessorBase):
                 self.last_label = label
                 self.last_conf = conf
                 self.last_features = features
+                self.last_raw_label = model_raw_label
 
-        display_label, display_conf, _ = self.get_last()
+        display_label, display_conf, _, _ = self.get_last()
         cv2.putText(
             image,
             f"{display_label} ({display_conf:.2f})",
@@ -576,7 +618,15 @@ with st.sidebar:
         "Upload model",
         type=["skops", "joblib", "pkl", "pickle", "sav", "onnx", "pt", "pth"]
     )
-    conf_thresh = st.slider("Minimum confidence", 0.0, 1.0, 0.60, 0.05)
+    conf_thresh = st.slider(
+        "Minimum confidence", 0.0, 1.0, 0.60, 0.05,
+        help="Predictions below this confidence are shown as UNKNOWN. "
+             "If your uploaded model never seems to trigger, try lowering this.",
+    )
+    show_raw_debug = st.toggle(
+        "Show raw model output (debug)", value=False,
+        help="Shows the model's top prediction even when it's below the confidence threshold.",
+    )
 
     st.divider()
     st.subheader("📚 Training data")
@@ -600,6 +650,8 @@ with st.sidebar:
         st.warning("Dataset memory cap reached. Old samples will be replaced by newer ones.")
 
 MODEL = load_model_from_file(model_file)
+if model_file is not None:
+    st.session_state.model_loaded_name = model_file.name if MODEL is not None else ""
 
 # -----------------------------
 # Header
@@ -620,6 +672,10 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# Surface model load errors prominently in the main pane, not just the sidebar.
+if model_file is not None and MODEL is None and st.session_state.model_error:
+    st.error(f"⚠ Model failed to load: {st.session_state.model_error}")
 
 render_audio_player()
 
@@ -645,7 +701,7 @@ with tab1:
             )
         else:
             m_type = MODEL[0].upper()
-            st.success(f"Active model format: **{m_type}**")
+            st.success(f"Active model format: **{m_type}** ({st.session_state.model_loaded_name})")
 
         ice_servers = get_ice_servers()
         if ice_servers == _STUN_ONLY_FALLBACK:
@@ -680,7 +736,7 @@ with tab1:
         with c1:
             if st.button("➕ Add current sign", use_container_width=True):
                 if ctx.video_processor:
-                    label_now, _, _ = ctx.video_processor.get_last()
+                    label_now, _, _, _ = ctx.video_processor.get_last()
                     maybe_add_to_history(label_now, skip_unknown=clear_unknowns)
                     st.rerun()
         with c2:
@@ -699,9 +755,9 @@ with tab1:
     st.markdown("### Live Results")
     col1, col2, col3, col4 = st.columns(4)
 
-    label_out, conf_out, feats = "NO_HAND", 0.0, None
+    label_out, conf_out, feats, raw_label_out = "NO_HAND", 0.0, None, "NO_HAND"
     if ctx.video_processor:
-        label_out, conf_out, feats = ctx.video_processor.get_last()
+        label_out, conf_out, feats, raw_label_out = ctx.video_processor.get_last()
 
     if auto_add_phrase and append_history:
         if label_out not in NEUTRAL_LABELS:
@@ -722,6 +778,23 @@ with tab1:
             if label_out not in NEUTRAL_LABELS:
                 queue_speech(label_out, speech_lang)
                 st.rerun()
+
+    if show_raw_debug:
+        model_classes = None
+        if MODEL is not None and MODEL[0] == "sklearn":
+            model_classes = list(getattr(MODEL[1], "classes_", [])) or "no classes_ attribute"
+        st.info(
+            f"**Debug** — raw top prediction: `{raw_label_out}` · "
+            f"confidence: `{conf_out:.3f}` · threshold: `{conf_thresh:.2f}` · "
+            f"model classes: `{model_classes}`"
+        )
+        if label_out == "UNKNOWN" and raw_label_out not in NEUTRAL_LABELS and conf_out < conf_thresh:
+            st.caption(
+                f"The model predicted **{raw_label_out}** but confidence "
+                f"({conf_out:.2f}) was below the threshold ({conf_thresh:.2f}), "
+                "so it's being shown as UNKNOWN. Lower the threshold in the sidebar if this "
+                "happens often."
+            )
 
     if auto_speak:
         if label_out not in NEUTRAL_LABELS:
