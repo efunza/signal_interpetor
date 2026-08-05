@@ -5,7 +5,7 @@ import base64
 import threading
 from collections import deque, Counter
 from datetime import datetime
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 
 import av
 import cv2
@@ -15,11 +15,23 @@ import pandas as pd
 import streamlit as st
 import mediapipe as mp
 import skops.io as sio
+import joblib
+import pickle
 from gtts import gTTS
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
-logger = logging.getLogger(__name__)
+# Safe optional imports for extended model formats
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------
 # App config
@@ -166,7 +178,7 @@ st.markdown(
 )
 
 # -----------------------------
-# Cached resources
+# Cached resources & Multi-format loaders
 # -----------------------------
 @st.cache_resource
 def get_hands():
@@ -178,41 +190,68 @@ def get_hands():
     )
 
 
-@st.cache_resource
-def load_model_bytes(file_bytes: bytes):
+def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
     """
-    Safely deserialize a trained classifier.
-
-    IMPORTANT: this deliberately does NOT use pickle.loads(). Unpickling
-    bytes from a user-uploaded file executes arbitrary code embedded in the
-    file (pickle's __reduce__ mechanism) - it is a remote code execution
-    vulnerability, not just a data-format risk. skops.io.loads() only
-    reconstructs objects from an allow-listed set of safe types, so an
-    uploaded model that references anything else is rejected instead of
-    silently executed.
-
-    To produce a compatible file, train your classifier as usual and save
-    it with:
-        import skops.io as sio
-        sio.dump(model, "model.skops")
-    instead of pickle.dump(...).
+    Multi-format model loader capable of deserializing Skops, Scikit-learn (Pickle/Joblib),
+    ONNX Runtime sessions, and PyTorch models.
     """
-    untrusted = sio.get_untrusted_types(data=file_bytes)
-    if untrusted:
-        raise ValueError(
-            "Model file references untrusted object types and was rejected: "
-            + ", ".join(untrusted)
-        )
-    return sio.loads(file_bytes)
-
-
-def load_model(file) -> Optional[object]:
-    if file is None:
+    if uploaded_file is None:
         return None
+
+    file_bytes = uploaded_file.getvalue()
+    filename = uploaded_file.name.lower()
+
     try:
-        return load_model_bytes(file.getvalue())
+        # 1. Skops Format (.skops)
+        if filename.endswith(".skops"):
+            untrusted = sio.get_untrusted_types(data=file_bytes)
+            if untrusted:
+                st.sidebar.error(
+                    "Skops model rejected due to untrusted types: " + ", ".join(untrusted)
+                )
+                return None
+            return ("sklearn", sio.loads(file_bytes))
+
+        # 2. Joblib Format (.joblib, .sav)
+        elif filename.endswith((".joblib", ".sav")):
+            model = joblib.load(io.BytesIO(file_bytes))
+            return ("sklearn", model)
+
+        # 3. Standard Pickle (.pkl, .pickle)
+        elif filename.endswith((".pkl", ".pickle")):
+            model = pickle.loads(file_bytes)
+            return ("sklearn", model)
+
+        # 4. ONNX Format (.onnx)
+        elif filename.endswith(".onnx"):
+            if ort is None:
+                st.sidebar.error("ONNX Runtime is not installed (`pip install onnxruntime`).")
+                return None
+            session = ort.InferenceSession(file_bytes)
+            return ("onnx", session)
+
+        # 5. PyTorch / TorchScript (.pt, .pth)
+        elif filename.endswith((".pt", ".pth")):
+            if torch is None:
+                st.sidebar.error("PyTorch is not installed (`pip install torch`).")
+                return None
+            buffer = io.BytesIO(file_bytes)
+            try:
+                model = torch.jit.load(buffer, map_location=torch.device("cpu"))
+            except Exception:
+                buffer.seek(0)
+                model = torch.load(buffer, map_location=torch.device("cpu"))
+
+            if hasattr(model, "eval"):
+                model.eval()
+            return ("torch", model)
+
+        else:
+            st.sidebar.error("Unsupported file extension.")
+            return None
+
     except Exception as e:
-        st.sidebar.error(f"Model load error: {e}")
+        st.sidebar.error(f"Failed to load model ({uploaded_file.name}): {e}")
         return None
 
 
@@ -225,41 +264,6 @@ def _secret(name: str) -> Optional[str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_ice_servers() -> list:
-    """
-    Returns WebRTC ICE servers for the video call the browser opens to this
-    app. A STUN server alone lets two peers discover their public address,
-    but many networks - including Streamlit Community Cloud's current setup,
-    and most mobile/carrier-grade NAT connections - block the direct
-    peer-to-peer connection STUN sets up. A TURN server relays the media
-    instead, which works almost everywhere. This checks two ways to get one,
-    in order, before giving up and falling back to STUN-only:
-
-    1. Static TURN credentials (secrets: TURN_URLS, TURN_USERNAME,
-       TURN_CREDENTIAL). TURN_URLS is comma-separated. This works with:
-         - Your own self-hosted coturn server (no third party at all -
-           run `coturn` on any VPS with a public IP, open UDP/TCP 3478 and
-           a relay port range in the firewall, and set a fixed
-           username/password with `lt-cred-mech` in turnserver.conf).
-           Guide: https://github.com/coturn/coturn/wiki/turnserver
-         - Metered.ca's free plan (metered.ca/tools/openrelay/) if you
-           switch its dashboard to "static credentials" mode instead of an
-           API key.
-       Example secrets.toml:
-         TURN_URLS = "turn:your-server.example.com:3478"
-         TURN_USERNAME = "someuser"
-         TURN_CREDENTIAL = "somepassword"
-
-    2. Metered.ca's free-tier dynamic credentials API (20 GB/month free,
-       no credit card required - sign up at metered.ca). Create a TURN app
-       in their dashboard, which gives you a subdomain and an API key.
-       Example secrets.toml:
-         METERED_DOMAIN = "your-subdomain"
-         METERED_API_KEY = "..."
-
-    Neither configured -> falls back to STUN-only, which works for local
-    testing but is likely to fail intermittently once deployed - a warning
-    is shown in the sidebar in that case.
-    """
     turn_urls = _secret("TURN_URLS")
     turn_username = _secret("TURN_USERNAME")
     turn_credential = _secret("TURN_CREDENTIAL")
@@ -289,12 +293,6 @@ def get_ice_servers() -> list:
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def tts_bytes(text: str, lang: str = "en") -> bytes:
-    """
-    Generate MP3 bytes using gTTS. Cached per (text, lang) so repeated
-    phrases (greetings, digits, common signs) don't re-hit the network on
-    every rerun - this also means the app needs internet access the first
-    time each phrase is spoken.
-    """
     fp = io.BytesIO()
     tts = gTTS(text=text, lang=lang)
     tts.write_to_fp(fp)
@@ -309,16 +307,10 @@ def queue_speech(text: str, lang: str = "en"):
         st.session_state.audio_bytes = tts_bytes(text, lang)
         st.session_state.audio_nonce += 1
     except Exception as e:
-        st.warning(
-            f"Speech generation failed ({e}). This usually means no internet "
-            "connection is available - gTTS requires one."
-        )
+        st.warning(f"Speech generation failed ({e}). Check internet connection for gTTS.")
 
 
 def render_audio_player():
-    """
-    Renders an auto-playing audio tag when audio exists.
-    """
     audio_bytes = st.session_state.get("audio_bytes")
     if not audio_bytes:
         return
@@ -348,19 +340,75 @@ def landmarks_to_features(hand_landmarks) -> np.ndarray:
     return pts.flatten()
 
 
-def predict_with_model(model, feats: np.ndarray, threshold: float) -> Tuple[str, float]:
-    try:
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba([feats])[0]
-            idx = int(np.argmax(proba))
-            conf = float(proba[idx])
-            label = str(model.classes_[idx]) if hasattr(model, "classes_") else f"CLASS_{idx}"
-            return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
-
-        label = model.predict([feats])[0]
-        return str(label), 0.50
-    except Exception:
+def predict_with_model(model_wrapper: Tuple[str, Any], feats: np.ndarray, threshold: float, target_labels: List[str]) -> Tuple[str, float]:
+    """
+    Unified predictor dispatching inference depending on framework type.
+    """
+    if model_wrapper is None:
         return "UNKNOWN", 0.0
+
+    model_type, model = model_wrapper
+
+    try:
+        # --- Scikit-Learn / Skops / Joblib / Pickle ---
+        if model_type == "sklearn":
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba([feats])[0]
+                idx = int(np.argmax(proba))
+                conf = float(proba[idx])
+                label = str(model.classes_[idx]) if hasattr(model, "classes_") else (
+                    target_labels[idx] if idx < len(target_labels) else f"CLASS_{idx}"
+                )
+                return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
+
+            label = model.predict([feats])[0]
+            return str(label), 0.50
+
+        # --- ONNX Runtime ---
+        elif model_type == "onnx":
+            input_name = model.get_inputs()[0].name
+            input_data = np.expand_dims(feats, axis=0).astype(np.float32)
+            outputs = model.run(None, {input_name: input_data})
+            
+            raw_out = outputs[0]
+            if isinstance(raw_out, list) and isinstance(raw_out[0], dict):
+                # Class probabilities output mapping
+                probs_dict = raw_out[0]
+                best_class = max(probs_dict, key=probs_dict.get)
+                conf = float(probs_dict[best_class])
+                return (str(best_class), conf) if conf >= threshold else ("UNKNOWN", conf)
+
+            probs = np.array(raw_out)[0]
+            if probs.ndim > 0 and len(probs) > 1:
+                # Calculate softmax if outputs are raw logits
+                if np.max(probs) > 1.0 or np.min(probs) < 0.0:
+                    exp_p = np.exp(probs - np.max(probs))
+                    probs = exp_p / exp_p.sum()
+
+                idx = int(np.argmax(probs))
+                conf = float(probs[idx])
+                label = target_labels[idx] if idx < len(target_labels) else str(idx)
+                return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
+
+            return str(raw_out[0]), 0.50
+
+        # --- PyTorch ---
+        elif model_type == "torch":
+            with torch.no_grad():
+                tensor_in = torch.tensor([feats], dtype=torch.float32)
+                out = model(tensor_in)
+                probs = torch.softmax(out, dim=1)[0]
+                conf, idx = torch.max(probs, dim=0)
+                conf_val = float(conf.item())
+                idx_val = int(idx.item())
+                label = target_labels[idx_val] if idx_val < len(target_labels) else str(idx_val)
+                return (label, conf_val) if conf_val >= threshold else ("UNKNOWN", conf_val)
+
+    except Exception as e:
+        logger.error(f"Inference error ({model_type}): {e}")
+        return "UNKNOWN", 0.0
+
+    return "UNKNOWN", 0.0
 
 
 def demo_gesture(hand_landmarks) -> Tuple[str, float]:
@@ -439,21 +487,6 @@ def sentence_text(items: List[str]) -> str:
 # Video processor
 # -----------------------------
 class SignVideoProcessor(VideoProcessorBase):
-    """
-    Runs on a background thread managed by streamlit-webrtc. Two things to
-    keep in mind when touching this class:
-
-    1. Anything read on the main Streamlit thread (label/confidence/features)
-       must go through get_last(), which holds the same lock recv() writes
-       under. Reading the bare attributes directly - as the original app did
-       - is a data race: the main thread can observe a label from one frame
-         paired with features from another.
-    2. Settings (model, threshold, smoothing window, etc.) are plain
-       attributes set from the main thread each rerun; that's fine to leave
-       unlocked since they're simple, independently-meaningful values, not a
-       tuple that needs to stay consistent with itself.
-    """
-
     def __init__(self):
         self.hands = get_hands()
         self.model = None
@@ -461,6 +494,7 @@ class SignVideoProcessor(VideoProcessorBase):
         self.show_landmarks = True
         self.process_every_n = 2
         self.smoothing_window = 5
+        self.labels_list = DEFAULT_LABELS
 
         self.last_label = "NO_HAND"
         self.last_conf = 0.0
@@ -475,7 +509,6 @@ class SignVideoProcessor(VideoProcessorBase):
             return self.last_label, self.last_conf, self.last_features
 
     def _smoothed_label(self, raw_label: str) -> str:
-        # Resize the deque if the user changed the smoothing window this run.
         if self._recent_labels.maxlen != self.smoothing_window:
             self._recent_labels = deque(self._recent_labels, maxlen=self.smoothing_window)
 
@@ -484,8 +517,6 @@ class SignVideoProcessor(VideoProcessorBase):
             return raw_label
 
         most_common, count = Counter(self._recent_labels).most_common(1)[0]
-        # Require a real majority before committing to a smoothed label,
-        # otherwise fall back to the latest raw reading.
         if count >= (self._recent_labels.maxlen // 2) + 1:
             return most_common
         return raw_label
@@ -507,7 +538,9 @@ class SignVideoProcessor(VideoProcessorBase):
                 features = landmarks_to_features(hand_lms)
 
                 if self.model is not None:
-                    raw_label, conf = predict_with_model(self.model, features, self.conf_thresh)
+                    raw_label, conf = predict_with_model(
+                        self.model, features, self.conf_thresh, self.labels_list
+                    )
                 else:
                     raw_label, conf = demo_gesture(hand_lms)
 
@@ -553,22 +586,20 @@ with st.sidebar:
     with st.expander("Performance & smoothing"):
         process_every_n = st.slider(
             "Process every Nth frame", 1, 5, 2,
-            help="Higher = less CPU load, lower = more responsive. Raise this on slower laptops.",
+            help="Higher = less CPU load, lower = more responsive.",
         )
         smoothing_window = st.slider(
             "Smoothing window (frames)", 1, 15, 5,
-            help="Majority-vote over this many processed frames before a prediction is treated as stable. "
-                 "Reduces flicker between similar signs.",
+            help="Majority-vote over frames to reduce label flickering.",
         )
 
     st.divider()
     st.subheader("🧠 Optional model")
-    st.caption(
-        "Upload a trained classifier based on 63 hand landmark features, saved with "
-        "`skops.io.dump(model, 'model.skops')` (NOT pickle - pickle files are no longer "
-        "accepted here because loading one can run arbitrary code)."
+    st.caption("Upload a model trained on 63 landmark features (.skops, .joblib, .pkl, .onnx, .pt)")
+    model_file = st.file_uploader(
+        "Upload model", 
+        type=["skops", "joblib", "pkl", "pickle", "sav", "onnx", "pt", "pth"]
     )
-    model_file = st.file_uploader("Upload model", type=["skops"])
     conf_thresh = st.slider("Minimum confidence", 0.0, 1.0, 0.60, 0.05)
 
     st.divider()
@@ -591,7 +622,7 @@ with st.sidebar:
     if collect_mode and len(st.session_state.dataset_rows) >= MAX_DATASET_ROWS:
         st.warning("Dataset memory cap reached. Old samples will be replaced by newer ones.")
 
-MODEL = load_model(model_file)
+MODEL = load_model_from_file(model_file)
 
 # -----------------------------
 # Header
@@ -606,7 +637,7 @@ st.markdown(
             <span class="pill">Live webcam interpretation</span>
             <span class="pill">Text output</span>
             <span class="pill">Speech output</span>
-            <span class="pill">Student-built innovation</span>
+            <span class="pill">Multi-Model Support</span>
         </div>
     </div>
     """,
@@ -628,36 +659,16 @@ with tab1:
         if MODEL is None:
             st.markdown('<span class="demo-badge">⚠ Demo mode - no trained model loaded</span>', unsafe_allow_html=True)
             st.caption(
-                "Predictions are coming from a small set of hardcoded heuristic rules, "
-                "not a trained classifier. Upload a `.skops` model in the sidebar for real recognition."
+                "Predictions are coming from hardcoded rules. Upload a supported classifier "
+                "in the sidebar for real sign recognition."
             )
-        st.caption("Allow webcam access, then show one hand sign clearly.")
+        else:
+            m_type = MODEL[0].upper()
+            st.success(f"Active model format: **{m_type}**")
 
         ice_servers = get_ice_servers()
         if ice_servers == _STUN_ONLY_FALLBACK:
-            st.sidebar.warning(
-                "No TURN server configured - the webcam connection may fail to establish "
-                "for visitors outside your local network. See the get_ice_servers() "
-                "docstring for free/self-hosted setup options."
-            )
-            with st.sidebar.expander("TURN diagnostics"):
-                st.write(
-                    {
-                        "TURN_URLS detected": bool(_secret("TURN_URLS")),
-                        "TURN_USERNAME detected": bool(_secret("TURN_USERNAME")),
-                        "TURN_CREDENTIAL detected": bool(_secret("TURN_CREDENTIAL")),
-                        "METERED_DOMAIN detected": bool(_secret("METERED_DOMAIN")),
-                        "METERED_API_KEY detected": bool(_secret("METERED_API_KEY")),
-                    }
-                )
-                st.caption(
-                    "'detected' means the app found a non-empty value for that secret - it "
-                    "doesn't confirm the value is correct. If METERED_DOMAIN/METERED_API_KEY "
-                    "both show True here but the connection still fails, the credentials "
-                    "themselves are likely wrong or the fetch to Metered failed silently - "
-                    "check the app logs (Manage app -> Logs) for a 'Could not fetch Metered "
-                    "ICE servers' line."
-                )
+            st.sidebar.warning("No TURN server configured - connection may fail outside local network.")
 
         ctx = webrtc_streamer(
             key="ribesign-live",
@@ -673,6 +684,7 @@ with tab1:
             ctx.video_processor.show_landmarks = show_landmarks
             ctx.video_processor.process_every_n = process_every_n
             ctx.video_processor.smoothing_window = smoothing_window
+            ctx.video_processor.labels_list = labels
 
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -728,8 +740,6 @@ with tab1:
                 queue_speech(label_out, speech_lang)
                 st.rerun()
 
-    st.caption("Tip: Good lighting, plain background, and keeping one hand centered will improve results.")
-
     if auto_speak:
         if label_out not in NEUTRAL_LABELS:
             if label_out != st.session_state.last_spoken_label:
@@ -744,7 +754,7 @@ with tab1:
         st.subheader("Training Data Controls")
 
         if feats is None:
-            st.info("Start the webcam and show a detectable sign before saving samples.")
+            st.info("Start webcam and display a hand sign to enable saving samples.")
         else:
             c1, c2, c3 = st.columns([1.1, 1.1, 2])
 
@@ -754,7 +764,7 @@ with tab1:
                     if trimmed:
                         st.warning(
                             f"Saved {samples_per_click} sample(s) for {selected_label}. "
-                            "Oldest samples were removed to stay within the memory limit."
+                            "Oldest samples removed to maintain capacity limits."
                         )
                     else:
                         st.success(f"Saved {samples_per_click} sample(s) for {selected_label}.")
@@ -787,8 +797,6 @@ with tab1:
 # -----------------------------
 with tab2:
     st.subheader("Sign Library")
-    st.caption("Browse supported signs for learning, testing, and dataset creation.")
-
     search = st.text_input("Search sign", placeholder="Try: hello, yes, 2, A...")
     search_value = search.strip().lower()
 
@@ -815,16 +823,13 @@ with tab3:
     st.subheader("Build and improve the model")
     st.markdown(
         """
-        This app can also be used to collect live sign samples for training a more accurate classifier.
-
         **Suggested workflow**
         1. Turn on **Enable data collection** in the sidebar
         2. Start the webcam
-        3. Choose a target label
-        4. Hold the sign clearly and save samples
-        5. Download the CSV
-        6. Train a classifier and save it with `skops.io.dump(model, "model.skops")`
-        7. Upload the `.skops` file back into the app
+        3. Save landmark samples for signs
+        4. Download the dataset CSV
+        5. Train a classifier in **Skops, Scikit-learn, ONNX, or PyTorch**
+        6. Upload your trained `.skops`, `.pkl`, `.joblib`, `.onnx`, or `.pt` model back into the app!
         """
     )
 
@@ -844,15 +849,8 @@ st.markdown(
     """
 **RibeSign AI** is a school technology project for sign interpretation using computer vision.
 
-**Pipeline:** Live webcam → MediaPipe hand landmarks → 63 normalized features → majority-vote smoothing → classifier → sign label → optional speech.
+**Pipeline:** Webcam → MediaPipe hand landmarks → 63 normalized features → Multi-format model inference → Majority-vote smoothing → Sign label & Speech synthesis.
 
 **Developed by:** **Ribe Boys Senior School**
-
-**Current limitations**
-- Single-hand detection only
-- No facial expressions or grammar recognition
-- Demo fallback rules are limited compared to a full trained model
-- True sign language recognition works better with motion-based sequence models
-- Models must be exported with `skops` rather than `pickle` for security reasons
 """
 )
