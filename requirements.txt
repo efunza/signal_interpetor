@@ -1,19 +1,29 @@
+# Core Streamlit + WebRTC
+streamlit>=1.36,<1.42
+streamlit-webrtc>=0.47.1,<0.60
 
-streamlit>=1.36
-streamlit-webrtc>=0.47
-av>=11.0
-opencv-python-headless>=4.9
-# Pinned below 0.10.30: that release removed the legacy `mp.solutions` API
-# (mp.solutions.hands) that this app uses. See:
+# Video / vision
+av>=11.0,<14
+opencv-python-headless>=4.9,<4.12
+
+# MediaPipe – MUST stay below 0.10.30 (solutions API removed in 0.10.30+)
 # https://github.com/google-ai-edge/mediapipe/issues/6192
 mediapipe>=0.10.14,<0.10.30
-numpy>=1.26
-pandas>=2.2
-gTTS>=2.5
-requests>=2.31
-skops>=0.10
-scikit-learn>=1.4
+
+# Data / ML
+numpy>=1.26,<2.1
+pandas>=2.2,<3
+scikit-learn>=1.4,<1.6
 joblib>=1.3
+skops>=0.10
+
+# Speech
+gTTS>=2.5
+
+# Networking / secrets
+requests>=2.31
+
+# Optional model backends (keep if you use .onnx / .pt models)
 onnxruntime>=1.17
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.2
