@@ -20,7 +20,7 @@ import pickle
 from gtts import gTTS
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
-# Safe optional imports for extended model formats
+# Optional backends
 try:
     import onnxruntime as ort
 except ImportError:
@@ -112,6 +112,7 @@ DEFAULTS = {
     "audio_bytes": None,
     "audio_nonce": 0,
 }
+
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -156,12 +157,6 @@ st.markdown(
             padding: 1rem;
             background: rgba(255,255,255,0.6);
         }
-        .result-box {
-            border-radius: 20px;
-            padding: 1rem;
-            border: 1px solid rgba(6,182,212,0.25);
-            background: rgba(6,182,212,0.08);
-        }
         .demo-badge {
             display: inline-block;
             padding: 0.2rem 0.6rem;
@@ -191,10 +186,6 @@ def get_hands():
 
 
 def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
-    """
-    Multi-format model loader capable of deserializing Skops, Scikit-learn (Pickle/Joblib),
-    ONNX Runtime sessions, and PyTorch models.
-    """
     if uploaded_file is None:
         return None
 
@@ -202,7 +193,6 @@ def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
     filename = uploaded_file.name.lower()
 
     try:
-        # 1. Skops Format (.skops)
         if filename.endswith(".skops"):
             untrusted = sio.get_untrusted_types(data=file_bytes)
             if untrusted:
@@ -212,17 +202,14 @@ def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
                 return None
             return ("sklearn", sio.loads(file_bytes))
 
-        # 2. Joblib Format (.joblib, .sav)
         elif filename.endswith((".joblib", ".sav")):
             model = joblib.load(io.BytesIO(file_bytes))
             return ("sklearn", model)
 
-        # 3. Standard Pickle (.pkl, .pickle)
         elif filename.endswith((".pkl", ".pickle")):
             model = pickle.loads(file_bytes)
             return ("sklearn", model)
 
-        # 4. ONNX Format (.onnx)
         elif filename.endswith(".onnx"):
             if ort is None:
                 st.sidebar.error("ONNX Runtime is not installed (`pip install onnxruntime`).")
@@ -230,7 +217,6 @@ def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
             session = ort.InferenceSession(file_bytes)
             return ("onnx", session)
 
-        # 5. PyTorch / TorchScript (.pt, .pth)
         elif filename.endswith((".pt", ".pth")):
             if torch is None:
                 st.sidebar.error("PyTorch is not installed (`pip install torch`).")
@@ -241,7 +227,6 @@ def load_model_from_file(uploaded_file) -> Optional[Tuple[str, Any]]:
             except Exception:
                 buffer.seek(0)
                 model = torch.load(buffer, map_location=torch.device("cpu"))
-
             if hasattr(model, "eval"):
                 model.eval()
             return ("torch", model)
@@ -259,7 +244,11 @@ _STUN_ONLY_FALLBACK = [{"urls": ["stun:stun.l.google.com:19302"]}]
 
 
 def _secret(name: str) -> Optional[str]:
-    return st.secrets.get(name, os.environ.get(name))
+    # Safe access – works even when secrets.toml does not exist
+    try:
+        return st.secrets.get(name, os.environ.get(name))
+    except Exception:
+        return os.environ.get(name)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -267,12 +256,14 @@ def get_ice_servers() -> list:
     turn_urls = _secret("TURN_URLS")
     turn_username = _secret("TURN_USERNAME")
     turn_credential = _secret("TURN_CREDENTIAL")
+
     if turn_urls and turn_username and turn_credential:
         urls = [u.strip() for u in turn_urls.split(",") if u.strip()]
         return [{"urls": urls, "username": turn_username, "credential": turn_credential}]
 
     metered_domain = _secret("METERED_DOMAIN")
     metered_api_key = _secret("METERED_API_KEY")
+
     if metered_domain and metered_api_key:
         try:
             resp = requests.get(
@@ -314,10 +305,8 @@ def render_audio_player():
     audio_bytes = st.session_state.get("audio_bytes")
     if not audio_bytes:
         return
-
     b64 = base64.b64encode(audio_bytes).decode("utf-8")
     nonce = st.session_state.get("audio_nonce", 0)
-
     st.markdown(
         f"""
         <audio id="tts-player-{nonce}" autoplay controls style="width:100%;">
@@ -340,39 +329,39 @@ def landmarks_to_features(hand_landmarks) -> np.ndarray:
     return pts.flatten()
 
 
-def predict_with_model(model_wrapper: Tuple[str, Any], feats: np.ndarray, threshold: float, target_labels: List[str]) -> Tuple[str, float]:
-    """
-    Unified predictor dispatching inference depending on framework type.
-    """
+def predict_with_model(
+    model_wrapper: Tuple[str, Any],
+    feats: np.ndarray,
+    threshold: float,
+    target_labels: List[str],
+) -> Tuple[str, float]:
     if model_wrapper is None:
         return "UNKNOWN", 0.0
 
     model_type, model = model_wrapper
 
     try:
-        # --- Scikit-Learn / Skops / Joblib / Pickle ---
         if model_type == "sklearn":
             if hasattr(model, "predict_proba"):
                 proba = model.predict_proba([feats])[0]
                 idx = int(np.argmax(proba))
                 conf = float(proba[idx])
-                label = str(model.classes_[idx]) if hasattr(model, "classes_") else (
-                    target_labels[idx] if idx < len(target_labels) else f"CLASS_{idx}"
+                label = (
+                    str(model.classes_[idx])
+                    if hasattr(model, "classes_")
+                    else (target_labels[idx] if idx < len(target_labels) else f"CLASS_{idx}")
                 )
                 return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
-
             label = model.predict([feats])[0]
             return str(label), 0.50
 
-        # --- ONNX Runtime ---
         elif model_type == "onnx":
             input_name = model.get_inputs()[0].name
             input_data = np.expand_dims(feats, axis=0).astype(np.float32)
             outputs = model.run(None, {input_name: input_data})
-            
+
             raw_out = outputs[0]
             if isinstance(raw_out, list) and isinstance(raw_out[0], dict):
-                # Class probabilities output mapping
                 probs_dict = raw_out[0]
                 best_class = max(probs_dict, key=probs_dict.get)
                 conf = float(probs_dict[best_class])
@@ -380,19 +369,15 @@ def predict_with_model(model_wrapper: Tuple[str, Any], feats: np.ndarray, thresh
 
             probs = np.array(raw_out)[0]
             if probs.ndim > 0 and len(probs) > 1:
-                # Calculate softmax if outputs are raw logits
                 if np.max(probs) > 1.0 or np.min(probs) < 0.0:
                     exp_p = np.exp(probs - np.max(probs))
                     probs = exp_p / exp_p.sum()
-
                 idx = int(np.argmax(probs))
                 conf = float(probs[idx])
                 label = target_labels[idx] if idx < len(target_labels) else str(idx)
                 return (label, conf) if conf >= threshold else ("UNKNOWN", conf)
-
             return str(raw_out[0]), 0.50
 
-        # --- PyTorch ---
         elif model_type == "torch":
             with torch.no_grad():
                 tensor_in = torch.tensor([feats], dtype=torch.float32)
@@ -414,7 +399,6 @@ def predict_with_model(model_wrapper: Tuple[str, Any], feats: np.ndarray, thresh
 def demo_gesture(hand_landmarks) -> Tuple[str, float]:
     tips = [4, 8, 12, 16, 20]
     pips = [3, 6, 10, 14, 18]
-
     extended = []
     for tip, pip in zip(tips, pips):
         extended.append(hand_landmarks.landmark[tip].y < hand_landmarks.landmark[pip].y)
@@ -437,25 +421,21 @@ def demo_gesture(hand_landmarks) -> Tuple[str, float]:
         return "4", 0.78
     if thumb and index and middle and ring and pinky:
         return "5", 0.82
-
     return "UNKNOWN", 0.40
 
 
 def draw_landmarks_cv2(image_bgr, hand_landmarks):
     h, w, _ = image_bgr.shape
-
     for a, b in list(mp_hands.HAND_CONNECTIONS):
         ax = int(hand_landmarks.landmark[a].x * w)
         ay = int(hand_landmarks.landmark[a].y * h)
         bx = int(hand_landmarks.landmark[b].x * w)
         by = int(hand_landmarks.landmark[b].y * h)
         cv2.line(image_bgr, (ax, ay), (bx, by), (0, 255, 255), 2)
-
     for lm in hand_landmarks.landmark:
         x = int(lm.x * w)
         y = int(lm.y * h)
         cv2.circle(image_bgr, (x, y), 4, (255, 0, 0), -1)
-
     return image_bgr
 
 
@@ -463,7 +443,6 @@ def add_samples_to_dataset(label: str, feats: np.ndarray, n: int):
     base = {f"f{i}": float(feats[i]) for i in range(len(feats))}
     for _ in range(n):
         st.session_state.dataset_rows.append({"label": label, **base})
-
     if len(st.session_state.dataset_rows) > MAX_DATASET_ROWS:
         st.session_state.dataset_rows = st.session_state.dataset_rows[-MAX_DATASET_ROWS:]
         return True
@@ -495,11 +474,9 @@ class SignVideoProcessor(VideoProcessorBase):
         self.process_every_n = 2
         self.smoothing_window = 5
         self.labels_list = DEFAULT_LABELS
-
         self.last_label = "NO_HAND"
         self.last_conf = 0.0
         self.last_features = None
-
         self._recent_labels = deque(maxlen=self.smoothing_window)
         self.lock = threading.Lock()
         self.frame_count = 0
@@ -511,11 +488,9 @@ class SignVideoProcessor(VideoProcessorBase):
     def _smoothed_label(self, raw_label: str) -> str:
         if self._recent_labels.maxlen != self.smoothing_window:
             self._recent_labels = deque(self._recent_labels, maxlen=self.smoothing_window)
-
         self._recent_labels.append(raw_label)
         if len(self._recent_labels) < self._recent_labels.maxlen:
             return raw_label
-
         most_common, count = Counter(self._recent_labels).most_common(1)[0]
         if count >= (self._recent_labels.maxlen // 2) + 1:
             return most_common
@@ -565,7 +540,6 @@ class SignVideoProcessor(VideoProcessorBase):
             2,
             cv2.LINE_AA,
         )
-
         return av.VideoFrame.from_ndarray(image, format="bgr24")
 
 
@@ -580,6 +554,7 @@ with st.sidebar:
     auto_add_phrase = st.toggle("Auto add stable signs to phrase", value=False)
     append_history = st.toggle("Build phrase from predictions", value=True)
     clear_unknowns = st.toggle("Ignore UNKNOWN in phrase", value=True)
+
     speech_lang_name = st.selectbox("Speech language", list(TTS_LANGUAGES.keys()))
     speech_lang = TTS_LANGUAGES[speech_lang_name]
 
@@ -596,8 +571,9 @@ with st.sidebar:
     st.divider()
     st.subheader("🧠 Optional model")
     st.caption("Upload a model trained on 63 landmark features (.skops, .joblib, .pkl, .onnx, .pt)")
+
     model_file = st.file_uploader(
-        "Upload model", 
+        "Upload model",
         type=["skops", "joblib", "pkl", "pickle", "sav", "onnx", "pt", "pth"]
     )
     conf_thresh = st.slider("Minimum confidence", 0.0, 1.0, 0.60, 0.05)
@@ -605,6 +581,7 @@ with st.sidebar:
     st.divider()
     st.subheader("📚 Training data")
     collect_mode = st.toggle("Enable data collection", value=False)
+
     labels = st.multiselect("Labels", KSL_SIGNS, default=DEFAULT_LABELS)
     if not labels:
         labels = DEFAULT_LABELS
@@ -656,8 +633,12 @@ with tab1:
 
     with left:
         st.subheader("Live camera")
+
         if MODEL is None:
-            st.markdown('<span class="demo-badge">⚠ Demo mode - no trained model loaded</span>', unsafe_allow_html=True)
+            st.markdown(
+                '<span class="demo-badge">⚠ Demo mode - no trained model loaded</span>',
+                unsafe_allow_html=True,
+            )
             st.caption(
                 "Predictions are coming from hardcoded rules. Upload a supported classifier "
                 "in the sidebar for real sign recognition."
@@ -668,7 +649,9 @@ with tab1:
 
         ice_servers = get_ice_servers()
         if ice_servers == _STUN_ONLY_FALLBACK:
-            st.sidebar.warning("No TURN server configured - connection may fail outside local network.")
+            st.sidebar.warning(
+                "No TURN server configured – connection may fail outside local network."
+            )
 
         ctx = webrtc_streamer(
             key="ribesign-live",
@@ -689,6 +672,7 @@ with tab1:
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### Phrase Builder")
+
         current_sentence = sentence_text(st.session_state.history)
         st.write(current_sentence if current_sentence else "_No signs added yet_")
 
@@ -699,7 +683,6 @@ with tab1:
                     label_now, _, _ = ctx.video_processor.get_last()
                     maybe_add_to_history(label_now, skip_unknown=clear_unknowns)
                     st.rerun()
-
         with c2:
             if st.button("🗑 Reset phrase", use_container_width=True):
                 st.session_state.history = []
@@ -757,7 +740,6 @@ with tab1:
             st.info("Start webcam and display a hand sign to enable saving samples.")
         else:
             c1, c2, c3 = st.columns([1.1, 1.1, 2])
-
             with c1:
                 if st.button("➕ Save sample(s)", use_container_width=True):
                     trimmed = add_samples_to_dataset(selected_label, feats, samples_per_click)
@@ -768,21 +750,17 @@ with tab1:
                         )
                     else:
                         st.success(f"Saved {samples_per_click} sample(s) for {selected_label}.")
-
             with c2:
                 if st.button("🗑 Clear dataset", use_container_width=True):
                     st.session_state.dataset_rows = []
                     st.warning("Dataset cleared.")
-
             with c3:
                 total = len(st.session_state.dataset_rows)
                 st.write(f"Total samples saved: **{total} / {MAX_DATASET_ROWS}**")
-
                 if total > 0:
                     df = pd.DataFrame(st.session_state.dataset_rows)
                     counts = df["label"].value_counts().reindex(labels, fill_value=0)
                     st.dataframe(counts.rename("count"), use_container_width=True)
-
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button(
                         "⬇️ Download dataset CSV",
