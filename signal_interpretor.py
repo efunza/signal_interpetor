@@ -3,6 +3,8 @@ import os
 import logging
 import base64
 import threading
+import queue
+import time
 from collections import deque, Counter
 from datetime import datetime
 from typing import Optional, Tuple, List, Any
@@ -111,6 +113,9 @@ SIGN_DESCRIPTIONS = {
 }
 
 mp_hands = mp.solutions.hands
+# Pre-compute connections once at import time — recomputing list(...) on every
+# drawn frame was pure overhead inside the hot path.
+HAND_CONNECTIONS = list(mp_hands.HAND_CONNECTIONS)
 
 # -----------------------------
 # Session state
@@ -298,7 +303,10 @@ def get_ice_servers() -> list:
                 timeout=5,
             )
             resp.raise_for_status()
-            return resp.json()
+            servers = resp.json()
+            # Always keep a STUN fallback alongside fetched TURN servers, in case
+            # the TURN relay itself is briefly unavailable.
+            return servers + _STUN_ONLY_FALLBACK
         except requests.RequestException as e:
             logger.warning("Could not fetch Metered ICE servers, falling back to STUN-only: %s", e)
 
@@ -466,7 +474,7 @@ def demo_gesture(hand_landmarks) -> Tuple[str, float, str]:
 
 def draw_landmarks_cv2(image_bgr, hand_landmarks):
     h, w, _ = image_bgr.shape
-    for a, b in list(mp_hands.HAND_CONNECTIONS):
+    for a, b in HAND_CONNECTIONS:
         ax = int(hand_landmarks.landmark[a].x * w)
         ay = int(hand_landmarks.landmark[a].y * h)
         bx = int(hand_landmarks.landmark[b].x * w)
@@ -505,6 +513,19 @@ def sentence_text(items: List[str]) -> str:
 # -----------------------------
 # Video processor
 # -----------------------------
+# FIX: previously all work (MediaPipe hand detection + model inference) ran
+# synchronously inside recv(), on the same thread aiortc uses to pull frames
+# off the WebRTC track. Any slowdown there (slow model, camera hiccup, CPU
+# contention) delayed recv()'s return, which stalls the media pipeline and
+# is a common cause of streamlit-webrtc dropping the connection after it
+# looked like it started fine.
+#
+# recv() now does the absolute minimum: resize the frame, hand it to a
+# background worker thread via a 1-slot "latest frame wins" queue, and
+# immediately draw whatever the worker most recently produced. Heavy work
+# (MediaPipe + model inference) happens entirely off the WebRTC thread, so a
+# slow model can only make the *label* stale — it can no longer stall video
+# delivery or trip a connection timeout.
 class SignVideoProcessor(VideoProcessorBase):
     def __init__(self):
         self.hands = get_hands()
@@ -518,9 +539,28 @@ class SignVideoProcessor(VideoProcessorBase):
         self.last_conf = 0.0
         self.last_raw_label = "NO_HAND"
         self.last_features = None
+        self.last_hand_landmarks = None
         self._recent_labels = deque(maxlen=self.smoothing_window)
         self.lock = threading.Lock()
         self.frame_count = 0
+
+        # Background inference worker: bounded to a single slot so we only
+        # ever process the most recent frame, dropping stale ones instead of
+        # building a backlog.
+        self._in_queue: "queue.Queue" = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        self._stop_event.set()
+        try:
+            self._in_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     def get_last(self):
         with self.lock:
@@ -537,17 +577,24 @@ class SignVideoProcessor(VideoProcessorBase):
             return most_common
         return raw_label
 
-    def recv(self, frame):
-        image = frame.to_ndarray(format="bgr24")
-        image = cv2.resize(image, (FRAME_WIDTH, FRAME_HEIGHT))
-        self.frame_count += 1
-
-        if self.frame_count % max(self.process_every_n, 1) == 0:
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = self.hands.process(rgb)
+    def _worker_loop(self):
+        """Runs off the WebRTC thread. Pulls the latest RGB frame, does
+        MediaPipe + model inference, and stashes results for recv() to draw
+        on the *next* frame it returns."""
+        while not self._stop_event.is_set():
+            item = self._in_queue.get()
+            if item is None:
+                break
+            rgb = item
+            try:
+                results = self.hands.process(rgb)
+            except Exception as e:
+                logger.error("MediaPipe processing error: %s", e)
+                continue
 
             raw_label, conf, model_raw_label = "NO_HAND", 0.0, "NO_HAND"
             features = None
+            hand_lms = None
 
             if results.multi_hand_landmarks:
                 hand_lms = results.multi_hand_landmarks[0]
@@ -560,9 +607,6 @@ class SignVideoProcessor(VideoProcessorBase):
                 else:
                     raw_label, conf, model_raw_label = demo_gesture(hand_lms)
 
-                if self.show_landmarks:
-                    image = draw_landmarks_cv2(image, hand_lms)
-
             label = self._smoothed_label(raw_label)
 
             with self.lock:
@@ -570,8 +614,30 @@ class SignVideoProcessor(VideoProcessorBase):
                 self.last_conf = conf
                 self.last_features = features
                 self.last_raw_label = model_raw_label
+                self.last_hand_landmarks = hand_lms
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+        image = cv2.resize(image, (FRAME_WIDTH, FRAME_HEIGHT))
+        self.frame_count += 1
+
+        if self.frame_count % max(self.process_every_n, 1) == 0:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # Non-blocking hand-off: if the worker is still busy on the
+            # previous frame, drop this one instead of queueing/blocking.
+            try:
+                self._in_queue.put_nowait(rgb)
+            except queue.Full:
+                pass
 
         display_label, display_conf, _, _ = self.get_last()
+
+        if self.show_landmarks:
+            with self.lock:
+                hand_lms = self.last_hand_landmarks
+            if hand_lms is not None:
+                image = draw_landmarks_cv2(image, hand_lms)
+
         cv2.putText(
             image,
             f"{display_label} ({display_conf:.2f})",
@@ -706,7 +772,9 @@ with tab1:
         ice_servers = get_ice_servers()
         if ice_servers == _STUN_ONLY_FALLBACK:
             st.sidebar.warning(
-                "No TURN server configured – connection may fail outside local network."
+                "No TURN server configured – connection may fail or drop outside a local "
+                "network. Set TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL or "
+                "METERED_DOMAIN/METERED_API_KEY in st.secrets to fix this."
             )
 
         ctx = webrtc_streamer(
